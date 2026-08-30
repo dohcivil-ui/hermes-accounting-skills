@@ -6,7 +6,7 @@ existing OCR result, while later production adapters consume durable state.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 import math
 import os
@@ -20,6 +20,7 @@ STATE_DB_ENV = "LEKZA_TRANSACTION_STATE_DB"
 UPLOAD_ROOTS_ENV = "LEKZA_ALLOWED_UPLOAD_ROOTS"
 MAX_SLIP_BYTES_ENV = "LEKZA_MAX_SLIP_BYTES"
 DEFAULT_MAX_SLIP_BYTES = 10 * 1024 * 1024
+DEFAULT_SHEETS_LEASE_SECONDS = 120
 
 OCR_FIELDS = ("reference_no", "amount", "date", "payer", "payee", "note")
 ACTIVE_STATES = {
@@ -45,6 +46,7 @@ MUTABLE_STATE_COLUMNS = {
     "history_json",
     "current_state",
     "drive_file_id",
+    "drive_upload_id",
     "slip_url",
     "sheets_row_identity",
     "retry_count",
@@ -75,6 +77,32 @@ class InvalidTransitionError(TransactionStateError):
 
 class UnsafeSourcePathError(TransactionStateError):
     """The source slip is outside the approved runtime file policy."""
+
+
+class SheetsClaimBusyError(TransactionStateError):
+    """Another live worker currently owns the Sheets write lease."""
+
+    claim_busy = True
+
+    def __init__(self, retry_after):
+        super().__init__("Sheets write lease is held by another worker")
+        self.retry_after = max(0.0, float(retry_after))
+
+
+class SheetsWriteClaim:
+    """Capability identifying the current durable Sheets lease owner."""
+
+    def __init__(self, transaction_id, owner_id, expires_at, owner_check):
+        self.transaction_id = str(transaction_id)
+        self.owner_id = str(owner_id)
+        self.expires_at = str(expires_at)
+        self._owner_check = owner_check
+        self.active = True
+
+    def assert_owner(self, minimum_valid_seconds=0):
+        if not self.active:
+            raise StaleStateError("Sheets write lease is no longer active")
+        self._owner_check(self, minimum_valid_seconds=minimum_valid_seconds)
 
 
 def _utc_now():
@@ -148,8 +176,11 @@ class SQLiteStateStore:
                 history_json TEXT NOT NULL DEFAULT '[]',
                 current_state TEXT NOT NULL,
                 drive_file_id TEXT,
+                drive_upload_id TEXT,
                 slip_url TEXT,
                 sheets_row_identity TEXT,
+                sheets_claim_owner TEXT,
+                sheets_claim_expires_at TEXT,
                 retry_count INTEGER NOT NULL DEFAULT 0,
                 retry_state TEXT,
                 last_error_code TEXT,
@@ -173,6 +204,22 @@ class SQLiteStateStore:
             """
         )
         self._connection.commit()
+        columns = {
+            row["name"]
+            for row in self._connection.execute("PRAGMA table_info(transaction_state)")
+        }
+        migrations = {
+            "drive_upload_id": "TEXT",
+            "sheets_claim_owner": "TEXT",
+            "sheets_claim_expires_at": "TEXT",
+        }
+        for column, definition in migrations.items():
+            if column in columns:
+                continue
+            with self._connection:
+                self._connection.execute(
+                    f"ALTER TABLE transaction_state ADD COLUMN {column} {definition}"
+                )
 
     def create(self, record):
         columns = tuple(record)
@@ -208,6 +255,141 @@ class SQLiteStateStore:
             (str(tenant_id), _normalize_reference(reference_no)),
         ).fetchone()
         return self._decode(row) if row is not None else None
+
+    def acquire_sheets_write_claim(
+        self,
+        transaction_id,
+        *,
+        platform,
+        chat_id,
+        telegram_user_id,
+        lease_seconds=DEFAULT_SHEETS_LEASE_SECONDS,
+    ):
+        """Atomically claim one transaction, committing before Google I/O."""
+        lease_seconds = float(lease_seconds)
+        if lease_seconds <= 0:
+            raise ValueError("Sheets lease duration must be positive")
+        connection = sqlite3.connect(str(self.path), timeout=10)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA busy_timeout=10000")
+        now = datetime.now(timezone.utc)
+        owner_id = str(uuid.uuid4())
+        expires_at = (now + timedelta(seconds=lease_seconds)).isoformat()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT platform, chat_id, telegram_user_id, current_state,
+                       sheets_claim_owner, sheets_claim_expires_at
+                FROM transaction_state WHERE transaction_id = ?
+                """,
+                (str(transaction_id),),
+            ).fetchone()
+            if row is None:
+                raise KeyError("Transaction not found")
+            owner = (row["platform"], row["chat_id"], row["telegram_user_id"])
+            actor = (str(platform), str(chat_id), str(telegram_user_id))
+            if owner != actor:
+                raise AuthorizationError("Transaction actor is not authorized")
+            if row["current_state"] != "sheets_pending":
+                raise InvalidTransitionError("Sheets write is not pending")
+            current_owner = str(row["sheets_claim_owner"] or "").strip()
+            current_expiry = str(row["sheets_claim_expires_at"] or "").strip()
+            if current_owner and current_expiry:
+                try:
+                    expiry = datetime.fromisoformat(current_expiry)
+                except ValueError as exc:
+                    raise TransactionStateError("Sheets lease expiry is malformed") from exc
+                if expiry > now:
+                    raise SheetsClaimBusyError((expiry - now).total_seconds())
+            cursor = connection.execute(
+                """
+                UPDATE transaction_state
+                SET sheets_claim_owner = ?, sheets_claim_expires_at = ?,
+                    updated_at = ?, version = version + 1
+                WHERE transaction_id = ? AND current_state = 'sheets_pending'
+                """,
+                (owner_id, expires_at, now.isoformat(), str(transaction_id)),
+            )
+            if cursor.rowcount != 1:
+                raise StaleStateError("Sheets write claim changed concurrently")
+            connection.commit()
+        finally:
+            connection.close()
+        return SheetsWriteClaim(
+            transaction_id,
+            owner_id,
+            expires_at,
+            self.assert_sheets_claim_owner,
+        )
+
+    def assert_sheets_claim_owner(self, claim, *, minimum_valid_seconds=0):
+        row = self._connection.execute(
+            """
+            SELECT sheets_claim_owner, sheets_claim_expires_at, current_state
+            FROM transaction_state WHERE transaction_id = ?
+            """,
+            (claim.transaction_id,),
+        ).fetchone()
+        if row is None:
+            raise KeyError("Transaction not found")
+        expires_at = str(row["sheets_claim_expires_at"] or "")
+        try:
+            expiry = datetime.fromisoformat(expires_at)
+        except ValueError as exc:
+            raise StaleStateError("Sheets write lease is invalid") from exc
+        now = datetime.now(timezone.utc)
+        if (
+            row["current_state"] != "sheets_pending"
+            or row["sheets_claim_owner"] != claim.owner_id
+            or (expiry - now).total_seconds() <= float(minimum_valid_seconds)
+        ):
+            claim.active = False
+            raise StaleStateError("Sheets write lease is stale")
+
+    def release_sheets_write_claim(self, claim):
+        with self._connection:
+            self._connection.execute(
+                """
+                UPDATE transaction_state
+                SET sheets_claim_owner = NULL, sheets_claim_expires_at = NULL,
+                    updated_at = ?, version = version + 1
+                WHERE transaction_id = ? AND current_state = 'sheets_pending'
+                  AND sheets_claim_owner = ?
+                """,
+                (_utc_now(), claim.transaction_id, claim.owner_id),
+            )
+        claim.active = False
+
+    def complete_sheets_write_claim(
+        self, claim, *, platform, chat_id, telegram_user_id, row_identity
+    ):
+        safe_identity = str(row_identity or "").strip()
+        if not safe_identity:
+            raise ValueError("Sheets row identity is required")
+        record = self.get(claim.transaction_id)
+        if record is None:
+            raise KeyError("Transaction not found")
+        owner = (record["platform"], record["chat_id"], record["telegram_user_id"])
+        actor = (str(platform), str(chat_id), str(telegram_user_id))
+        if owner != actor:
+            raise AuthorizationError("Transaction actor is not authorized")
+        with self._connection:
+            cursor = self._connection.execute(
+                """
+                UPDATE transaction_state
+                SET current_state = 'confirmed', sheets_row_identity = ?,
+                    sheets_claim_owner = NULL, sheets_claim_expires_at = NULL,
+                    updated_at = ?, version = version + 1
+                WHERE transaction_id = ? AND current_state = 'sheets_pending'
+                  AND sheets_claim_owner = ?
+                """,
+                (safe_identity, _utc_now(), claim.transaction_id, claim.owner_id),
+            )
+        claim.active = False
+        if cursor.rowcount != 1:
+            raise StaleStateError("Sheets write lease is no longer owned")
+        return self.get(claim.transaction_id)
 
     def transition(
         self,
@@ -376,6 +558,37 @@ class TransactionFlow:
             transaction_id, platform, chat_id, telegram_user_id
         )
         return dict(record)
+
+    def claim_sheets_write(
+        self,
+        transaction_id,
+        *,
+        platform,
+        chat_id,
+        telegram_user_id,
+        lease_seconds=DEFAULT_SHEETS_LEASE_SECONDS,
+    ):
+        return self._store.acquire_sheets_write_claim(
+            transaction_id,
+            platform=platform,
+            chat_id=chat_id,
+            telegram_user_id=telegram_user_id,
+            lease_seconds=lease_seconds,
+        )
+
+    def release_sheets_write(self, claim):
+        self._store.release_sheets_write_claim(claim)
+
+    def complete_sheets_write(
+        self, claim, *, platform, chat_id, telegram_user_id, sheets_row_identity
+    ):
+        return self._store.complete_sheets_write_claim(
+            claim,
+            platform=platform,
+            chat_id=chat_id,
+            telegram_user_id=telegram_user_id,
+            row_identity=sheets_row_identity,
+        )
 
     def choose(
         self,
@@ -600,6 +813,11 @@ class TransactionFlow:
         safe_link = str(web_view_link or "").strip()
         if not safe_file_id or not safe_link:
             raise ValueError("Drive result requires file_id and webViewLink")
+        record = self._require_authorized(
+            transaction_id, platform, chat_id, telegram_user_id
+        )
+        if record.get("drive_upload_id") and record["drive_upload_id"] != safe_file_id:
+            raise InvalidTransitionError("Drive result does not match reserved file ID")
         return self._transition_state(
             transaction_id,
             expected_version=expected_version,
@@ -610,6 +828,41 @@ class TransactionFlow:
             next_state="drive_uploaded",
             changes={"drive_file_id": safe_file_id, "slip_url": safe_link},
         )
+
+    def reserve_drive_upload(
+        self,
+        transaction_id,
+        *,
+        expected_version,
+        platform,
+        chat_id,
+        telegram_user_id,
+        file_id,
+    ):
+        """Durably reserve Drive's pre-generated ID before uploading bytes."""
+        safe_file_id = str(file_id or "").strip()
+        if not safe_file_id:
+            raise ValueError("Drive upload reservation requires file_id")
+        record = self._require_authorized(
+            transaction_id, platform, chat_id, telegram_user_id
+        )
+        self._require_current_version(record, expected_version)
+        if record["current_state"] != "drive_pending":
+            raise InvalidTransitionError("Drive upload is not pending")
+        if record.get("drive_upload_id"):
+            if record["drive_upload_id"] != safe_file_id:
+                raise InvalidTransitionError("Drive upload ID is already reserved")
+            return self._view(record)
+        updated = self._store.transition(
+            transaction_id,
+            platform=platform,
+            chat_id=chat_id,
+            telegram_user_id=telegram_user_id,
+            expected_version=expected_version,
+            allowed_from={"drive_pending"},
+            changes={"drive_upload_id": safe_file_id},
+        )
+        return self._view(updated)
 
     def mark_sheets_pending(
         self,

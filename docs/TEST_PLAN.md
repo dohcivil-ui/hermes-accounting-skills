@@ -56,3 +56,30 @@ The deterministic SQLite integration harness covers:
 
 The Drive and Sheets steps in these tests are durable state checkpoints only.
 Production adapters and real Telegram callback wiring remain outside Phase A.
+
+## Phase B adapter acceptance
+
+Mocked Google REST integration tests cover frozen schema validation, Drive
+upload/retry/crash recovery, atomic Sheets append and duplicate prevention,
+malformed responses, numeric amount preservation, and restart recovery through
+the production save coordinator. No test performs a live Google API call.
+
+### Opt-in Google smoke test
+
+Use a disposable spreadsheet with the frozen schemas and a disposable Drive
+folder. Never provide production resource IDs. Set all variables below, then run:
+
+```text
+LEKZA_RUN_GOOGLE_LIVE_TESTS=1
+LEKZA_LIVE_TEST_RESOURCE_ACK=designated-test-resources
+LEKZA_GOOGLE_ACCESS_TOKEN=<short-lived test credential>
+LEKZA_TEST_SLIP_FOLDER_ID=<disposable test folder>
+LEKZA_TEST_ACCOUNTING_SPREADSHEET_ID=<disposable test spreadsheet>
+LEKZA_TEST_UPLOAD_ROOT=<absolute dedicated local test directory>
+LEKZA_TEST_TRANSACTION_STATE_DB=<absolute DB path beneath test upload root>
+python -m unittest tests.live.test_google_adapters_live -v
+```
+
+The smoke test is skipped unless explicitly enabled. It rejects test resource
+IDs that equal configured production IDs, writes only a synthetic one-baht row
+and synthetic image, and reuses its persistent test state on rerun.
