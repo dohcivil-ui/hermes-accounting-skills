@@ -21,3 +21,10 @@ Lekza is a Telegram-first accounting assistant for construction-project income a
 ## Sync baseline
 
 The source baseline for branch `sync/hostinger-runtime-20260830` is the Hostinger runtime snapshot created on 2026-08-30. Snapshot metadata and runtime configuration are audit inputs, not repository source.
+
+## Product Direction
+
+- Lekza is the first Reference Implementation for the broader contractor-accounting product direction.
+- The next product target is a reusable SME Starter Template.
+- Current delivery remains focused on stabilizing Lekza Production first.
+- Future capabilities must not create MVP scope creep; Phase 9–10 work stays out of scope until the Lekza production baseline is stable.

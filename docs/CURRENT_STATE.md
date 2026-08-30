@@ -18,6 +18,17 @@ Last verified from the Hostinger Managed Hermes snapshot created on 2026-08-30.
 - Population of `Transactions.slip_url`.
 - Transactional save verification.
 
+## Next Priority
+
+1. Telegram Button Flow v2.
+2. Drive + `slip_url` transactional save.
+3. Project Summary / Close Job.
+4. Thai PDF.
+5. AI Audit.
+6. Cost Meter.
+7. End-to-End Test.
+8. Demo.
+
 ## Repository baseline
 
 - Production skills live under `skills/accounting/`.
