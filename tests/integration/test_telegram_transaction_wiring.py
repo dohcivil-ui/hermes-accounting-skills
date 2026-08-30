@@ -1,5 +1,6 @@
 import asyncio
 import importlib.util
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -431,15 +432,16 @@ class TelegramTransactionWiringTests(unittest.TestCase):
                 self.edits.append(kwargs)
 
         try:
-            adapter = Adapter()
-            lekza_query = Query(cancel_payload)
-            asyncio.run(adapter._handle_callback_query(
-                types.SimpleNamespace(callback_query=lekza_query), None
-            ))
-            other_query = Query("cl:existing:0")
-            asyncio.run(adapter._handle_callback_query(
-                types.SimpleNamespace(callback_query=other_query), None
-            ))
+            with patch.dict(os.environ, {"LEKZA_RUNTIME_ENV": "production"}):
+                adapter = Adapter()
+                lekza_query = Query(cancel_payload)
+                asyncio.run(adapter._handle_callback_query(
+                    types.SimpleNamespace(callback_query=lekza_query), None
+                ))
+                other_query = Query("cl:existing:0")
+                asyncio.run(adapter._handle_callback_query(
+                    types.SimpleNamespace(callback_query=other_query), None
+                ))
         finally:
             sys.modules.pop(fake_name, None)
 
@@ -497,6 +499,7 @@ class TelegramTransactionWiringTests(unittest.TestCase):
         bridge.register(bridge_context)
         adapter = Adapter()
         adapter._bot = Bot()
+        adapter._bot.id = "3001"
         gateway = types.SimpleNamespace(adapters={"telegram": adapter})
         source = types.SimpleNamespace(
             platform="telegram",
@@ -563,7 +566,8 @@ class TelegramTransactionWiringTests(unittest.TestCase):
             )
 
         try:
-            with patch.object(bridge, "call_akson_ocr", return_value=ocr_result), \
+            with patch.dict(os.environ, {"LEKZA_RUNTIME_ENV": "production"}), \
+                    patch.object(bridge, "call_akson_ocr", return_value=ocr_result), \
                     patch.object(bridge.os, "makedirs"), \
                     patch("builtins.open", mock_open()):
                 asyncio.run(invoke_twice())

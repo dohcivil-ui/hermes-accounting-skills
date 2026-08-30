@@ -38,9 +38,13 @@ existing OCR result and does not contain an OCR client or make network calls.
 
 ## Trust boundaries
 
+- `LEKZA_RUNTIME_ENV` is mandatory and accepts only `production` or `staging`.
+  Unknown, empty, and misspelled modes fail before integration side effects.
 - `AKSONOCR_API_KEY` and integration IDs come from the runtime environment.
 - Real slips and transaction rows belong to runtime storage, not this repository.
 - Writes require confirmation from the correct Telegram user.
+- Staging OCR requires the incoming Telegram bot, chat, and user identities to
+  match explicit staging allowlists before any media download or OCR request.
 
 ## Durable transaction state
 
@@ -49,6 +53,11 @@ Phase A stores transaction state in SQLite through
 data path outside source control. Approved upload/cache roots come from
 `LEKZA_ALLOWED_UPLOAD_ROOTS`; `LEKZA_MAX_SLIP_BYTES` optionally sets the maximum
 source size.
+
+Phase D staging additionally requires an explicit `LEKZA_STAGING_DATA_ROOT`.
+The SQLite DB and every upload/cache root must resolve beneath that external
+staging root and outside the repository, `/data/plugins`, and
+`/data/skills/accounting`.
 
 The operation identity is a UUID `transaction_id`. The tenant-scoped normalized
 `reference_no` is the business duplicate key. Every transition checks

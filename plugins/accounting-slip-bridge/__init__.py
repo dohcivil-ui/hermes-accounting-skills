@@ -3,6 +3,39 @@ import sys
 import json
 import requests
 import urllib.parse
+import importlib.util
+
+
+_STAGING_GUARD = None
+
+
+def _staging_guard():
+    global _STAGING_GUARD
+    if _STAGING_GUARD is None:
+        path = os.path.join(os.path.dirname(__file__), "staging_guard.py")
+        spec = importlib.util.spec_from_file_location("lekza_slip_staging_guard", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _STAGING_GUARD = module
+    return _STAGING_GUARD
+
+
+def _telegram_bot_id(gateway):
+    adapters = getattr(gateway, "adapters", None)
+    adapter = adapters.get("telegram") if isinstance(adapters, dict) else None
+    bot = getattr(adapter, "_bot", None) or getattr(adapter, "bot", None)
+    return str(getattr(bot, "id", "") or "")
+
+
+def _authorize_runtime_actor(source, gateway):
+    guard = _staging_guard()
+    mode = guard.validate_runtime_environment()
+    if mode == "staging":
+        guard.validate_staging_ocr_actor(
+            _telegram_bot_id(gateway),
+            str(getattr(source, "chat_id", "") or ""),
+            str(getattr(source, "user_id", "") or ""),
+        )
 
 def call_akson_ocr(image_path_or_url):
     api_key = os.getenv("AKSONOCR_API_KEY")
@@ -128,21 +161,7 @@ def register(ctx):
             if message_id is None and isinstance(event, dict):
                 message_id = event.get("message_id")
 
-            # 4. Diagnostic log before checking platform (no API key)
-            log_dir = "/data/logs"
-            os.makedirs(log_dir, exist_ok=True)
-            log_file = os.path.join(log_dir, "accounting-slip-bridge.log")
-
-            log_entry = {
-                "hook_fired": True,
-                "platform": platform_val,
-                "media_count": len(media_urls or []),
-                "message_id": message_id
-            }
-            with open(log_file, "a", encoding="utf-8") as f:
-                f.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
-
-            # 5. Check if platform is telegram
+            # 4. Check if platform is telegram
             if platform_val != "telegram":
                 return None
 
@@ -159,6 +178,22 @@ def register(ctx):
             if not chosen_media:
                 return None
 
+            # Authorization and runtime selection must complete before logging,
+            # media download, OCR, or any other integration side effect.
+            _authorize_runtime_actor(source, gateway)
+
+            log_dir = "/data/logs"
+            os.makedirs(log_dir, exist_ok=True)
+            log_file = os.path.join(log_dir, "accounting-slip-bridge.log")
+            log_entry = {
+                "hook_fired": True,
+                "platform": platform_val,
+                "media_count": len(media_urls or []),
+                "message_id": message_id
+            }
+            with open(log_file, "a", encoding="utf-8") as f:
+                f.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
+
             target_path = chosen_media
             if target_path.startswith("file://"):
                 target_path = urllib.parse.unquote(target_path[7:])
@@ -169,7 +204,7 @@ def register(ctx):
             ocr_log = {
                 "hook_fired": True,
                 "platform": platform_val,
-                "chosen_media": chosen_media,
+                "media_is_remote": str(chosen_media).startswith(("http://", "https://")),
                 "akson_called": ocr_res.get("akson_called", False),
                 "confidence": ocr_res.get("confidence"),
                 "http_status": ocr_res.get("http_status"),

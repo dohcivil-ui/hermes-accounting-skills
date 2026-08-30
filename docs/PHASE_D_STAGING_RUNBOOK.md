@@ -17,6 +17,7 @@ The runtime fails closed in staging unless all variables below are present:
 LEKZA_RUNTIME_ENV=staging
 LEKZA_STAGING_RESOURCE_ACK=designated-staging-resources
 LEKZA_STAGING_TELEGRAM_BOT_ACK=designated-test-bot
+LEKZA_STAGING_TELEGRAM_BOT_IDS=<comma-separated test bot IDs>
 LEKZA_STAGING_TELEGRAM_CHAT_IDS=<comma-separated test chat IDs>
 LEKZA_STAGING_TELEGRAM_USER_IDS=<comma-separated test user IDs>
 LEKZA_PRODUCTION_SLIP_FOLDER_ID=<production ID used only for inequality guard>
@@ -25,6 +26,7 @@ AKSONOCR_API_KEY=<staging-authorized secret>
 LEKZA_GOOGLE_ACCESS_TOKEN=<short-lived test credential>
 LEKZA_SLIP_FOLDER_ID=<disposable staging folder ID>
 LEKZA_ACCOUNTING_SPREADSHEET_ID=<disposable staging spreadsheet ID>
+LEKZA_STAGING_DATA_ROOT=<absolute external staging data root>
 LEKZA_TRANSACTION_STATE_DB=<absolute staging SQLite path>
 LEKZA_ALLOWED_UPLOAD_ROOTS=<absolute staging upload/cache root(s)>
 LEKZA_ACTIVE_PROJECTS_JSON=["Phase D Test Project"]
@@ -35,6 +37,11 @@ LEKZA_PROMPT_DELIVERY_LEASE_SECONDS=120
 
 The production IDs are guard inputs only and must not be selected as the active
 `LEKZA_SLIP_FOLDER_ID` or `LEKZA_ACCOUNTING_SPREADSHEET_ID`.
+The state DB and all allowed upload roots must resolve beneath
+`LEKZA_STAGING_DATA_ROOT`; repository paths, `/data/plugins`, and
+`/data/skills/accounting` are rejected. Runtime mode is mandatory: production
+must explicitly use `LEKZA_RUNTIME_ENV=production`, while this runbook requires
+`staging`. Missing or unknown modes fail before OCR or other integration work.
 
 ## Staging deployment procedure (after Review Gate D1 approval)
 

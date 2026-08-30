@@ -52,10 +52,11 @@ def _controller_from_environment():
         google = _load_runtime_module(
             "lekza_google_adapters", bridge / "google_adapters.py"
         )
-        if str(os.environ.get("LEKZA_RUNTIME_ENV") or "").lower() == "staging":
-            guard = _load_runtime_module(
-                "lekza_staging_guard", bridge / "staging_guard.py"
-            )
+        guard = _load_runtime_module(
+            "lekza_staging_guard", bridge / "staging_guard.py"
+        )
+        runtime_mode = guard.validate_runtime_environment()
+        if runtime_mode == "staging":
             guard.validate_staging_environment()
         try:
             projects = json.loads(os.environ.get("LEKZA_ACTIVE_PROJECTS_JSON", "[]"))
@@ -89,13 +90,13 @@ def _set_controller_for_tests(controller):
 
 
 def _validate_staging_actor(chat_id, telegram_user_id):
-    if str(os.environ.get("LEKZA_RUNTIME_ENV") or "").lower() != "staging":
-        return
     bridge = Path(__file__).resolve().parents[1] / "accounting-slip-bridge"
     guard = _load_runtime_module(
         "lekza_staging_guard", bridge / "staging_guard.py"
     )
-    guard.validate_staging_actor(str(chat_id), str(telegram_user_id))
+    runtime_mode = guard.validate_runtime_environment()
+    if runtime_mode == "staging":
+        guard.validate_staging_actor(str(chat_id), str(telegram_user_id))
 
 
 def _validate_adapter_class(adapter_cls):

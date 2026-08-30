@@ -1,6 +1,7 @@
 import importlib.util
 import os
 from pathlib import Path
+import tempfile
 import unittest
 
 
@@ -18,6 +19,8 @@ def load_guard():
 class StagingGuardTests(unittest.TestCase):
     def setUp(self):
         self.guard = load_guard()
+        self.temp = tempfile.TemporaryDirectory()
+        self.staging_root = Path(self.temp.name) / "lekza-staging"
         self.environment = {
             "LEKZA_RUNTIME_ENV": "staging",
             "LEKZA_STAGING_RESOURCE_ACK": "designated-staging-resources",
@@ -28,12 +31,17 @@ class StagingGuardTests(unittest.TestCase):
             "LEKZA_ACCOUNTING_SPREADSHEET_ID": "staging-sheet",
             "LEKZA_PRODUCTION_SLIP_FOLDER_ID": "production-folder",
             "LEKZA_PRODUCTION_ACCOUNTING_SPREADSHEET_ID": "production-sheet",
-            "LEKZA_TRANSACTION_STATE_DB": str(ROOT / "synthetic-state.db"),
-            "LEKZA_ALLOWED_UPLOAD_ROOTS": str(ROOT / "synthetic-uploads"),
+            "LEKZA_STAGING_DATA_ROOT": str(self.staging_root),
+            "LEKZA_TRANSACTION_STATE_DB": str(self.staging_root / "state" / "transactions.db"),
+            "LEKZA_ALLOWED_UPLOAD_ROOTS": str(self.staging_root / "uploads"),
             "LEKZA_ACTIVE_PROJECTS_JSON": '["Synthetic Project"]',
             "LEKZA_STAGING_TELEGRAM_CHAT_IDS": "1001,1002",
             "LEKZA_STAGING_TELEGRAM_USER_IDS": "2001",
+            "LEKZA_STAGING_TELEGRAM_BOT_IDS": "3001",
         }
+
+    def tearDown(self):
+        self.temp.cleanup()
 
     def test_designated_staging_configuration_is_accepted(self):
         config = self.guard.validate_staging_environment(self.environment)
@@ -57,14 +65,72 @@ class StagingGuardTests(unittest.TestCase):
         with self.assertRaisesRegex(PermissionError, "user"):
             self.guard.validate_staging_actor("1001", "9999", self.environment)
 
+    def test_wrong_bot_is_rejected_for_ocr(self):
+        with self.assertRaisesRegex(PermissionError, "bot"):
+            self.guard.validate_staging_ocr_actor(
+                "9999", "1001", "2001", self.environment
+            )
+        self.assertTrue(
+            self.guard.validate_staging_ocr_actor(
+                "3001", "1001", "2001", self.environment
+            )
+        )
+
     def test_relative_db_and_upload_paths_are_rejected(self):
         self.environment["LEKZA_TRANSACTION_STATE_DB"] = "state.db"
         with self.assertRaisesRegex(ValueError, "must be absolute"):
             self.guard.validate_staging_environment(self.environment)
-        self.environment["LEKZA_TRANSACTION_STATE_DB"] = str(ROOT / "state.db")
+        self.environment["LEKZA_TRANSACTION_STATE_DB"] = str(
+            self.staging_root / "state" / "transactions.db"
+        )
         self.environment["LEKZA_ALLOWED_UPLOAD_ROOTS"] = "uploads"
         with self.assertRaisesRegex(ValueError, "absolute paths"):
             self.guard.validate_staging_environment(self.environment)
+
+    def test_repository_paths_are_rejected_even_with_a_broad_staging_root(self):
+        self.environment["LEKZA_STAGING_DATA_ROOT"] = str(ROOT.parent)
+        self.environment["LEKZA_TRANSACTION_STATE_DB"] = str(ROOT / "state.db")
+        with self.assertRaisesRegex(ValueError, "repository checkout"):
+            self.guard.validate_staging_environment(self.environment)
+
+    def test_paths_outside_explicit_staging_root_are_rejected(self):
+        self.environment["LEKZA_TRANSACTION_STATE_DB"] = str(
+            Path(self.temp.name) / "other" / "state.db"
+        )
+        with self.assertRaisesRegex(ValueError, "beneath LEKZA_STAGING_DATA_ROOT"):
+            self.guard.validate_staging_environment(self.environment)
+
+    def test_runtime_application_paths_are_rejected(self):
+        application_root = Path("/data/plugins").resolve()
+        self.environment["LEKZA_STAGING_DATA_ROOT"] = str(application_root.parent)
+        self.environment["LEKZA_TRANSACTION_STATE_DB"] = str(
+            application_root / "state.db"
+        )
+        self.environment["LEKZA_ALLOWED_UPLOAD_ROOTS"] = str(
+            application_root / "uploads"
+        )
+        with self.assertRaisesRegex(ValueError, "runtime application paths"):
+            self.guard.validate_staging_environment(self.environment)
+
+    def test_runtime_mode_must_be_explicit_and_known(self):
+        for value in (None, "", "stagng", "development"):
+            environment = dict(self.environment)
+            if value is None:
+                environment.pop("LEKZA_RUNTIME_ENV")
+            else:
+                environment["LEKZA_RUNTIME_ENV"] = value
+            with self.subTest(value=value), self.assertRaisesRegex(
+                ValueError, "production or staging"
+            ):
+                self.guard.validate_runtime_environment(environment)
+
+    def test_explicit_production_mode_is_preserved_without_staging_config(self):
+        self.assertEqual(
+            self.guard.validate_runtime_environment(
+                {"LEKZA_RUNTIME_ENV": "production"}
+            ),
+            "production",
+        )
 
 
 if __name__ == "__main__":
