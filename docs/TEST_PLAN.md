@@ -13,7 +13,7 @@ python -m unittest discover -s tests -p "test_*.py" -v
 - Contract: required runtime paths, skill frontmatter, and plugin manifests.
 - Unit: AksonOCR error/success behavior and Telegram button-label behavior.
 - Safety: forbidden runtime artifacts and likely credential assignments.
-- Integration: reserved for mocked end-to-end Hermes flows; live external services are never called by tests.
+- Integration: durable transaction state, mocked external checkpoints, restart recovery, authorization, and idempotency; live external services are never called by tests.
 
 ## Fixture policy
 
@@ -37,3 +37,22 @@ Baseline tests remain required. Add the following acceptance gates as their road
 - Thai PDF render validation: embed a Thai font and inspect rendered pages before delivery.
 - AI Audit safety: AI may suggest classifications or anomalies but must not invent accounting values or bypass human confirmation.
 - Cost Meter: validate OCR requests/credits, AI tokens, cost per slip, cost per Job, and monthly totals.
+
+## Phase A durable-state acceptance
+
+The deterministic SQLite integration harness covers:
+
+- restart after OCR state creation;
+- restart after Confirm before Drive;
+- restart after Drive metadata is persisted and before Sheets;
+- restart after the Sheets row identity is persisted;
+- callback replay and stale-button rejection through state versions;
+- two-connection concurrent Confirm convergence;
+- wrong-user transition rejection;
+- tenant-scoped normalized `reference_no` uniqueness;
+- failure/retry state and retry count persistence;
+- allowed-root, traversal, symlink, image type, extension, and size checks;
+- minimal OCR-field retention and numeric amount normalization.
+
+The Drive and Sheets steps in these tests are durable state checkpoints only.
+Production adapters and real Telegram callback wiring remain outside Phase A.

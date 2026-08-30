@@ -17,6 +17,7 @@ class RuntimeLayoutTests(unittest.TestCase):
             "skills/accounting/query-payee-summary/SKILL.md",
             "skills/accounting/scheduled-project-report/SKILL.md",
             "plugins/accounting-slip-bridge/__init__.py",
+            "plugins/accounting-slip-bridge/transaction_flow.py",
             "plugins/accounting-slip-bridge/plugin.yaml",
             "plugins/telegram-clarify-pretty/__init__.py",
             "plugins/telegram-clarify-pretty/plugin.yaml",
