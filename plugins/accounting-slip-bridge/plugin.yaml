@@ -1,0 +1,4 @@
+name: accounting-slip-bridge
+version: 1.0.0
+description: Hermes General Plugin for AksonOCR slip processing on Telegram messages.
+entrypoint: __init__.py

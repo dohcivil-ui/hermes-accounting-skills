@@ -1,0 +1,41 @@
+# Hostinger runtime snapshots and export metadata
+/_runtime_snapshot/
+/config.yaml
+/CURRENT_STATE.md
+/MANIFEST.md
+/RUNTIME_VERSION.md
+
+# Runtime output
+logs/
+*.log
+cache/
+.cache/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+*credentials*.json
+*service-account*.json
+*.pem
+*.key
+
+# Local/real accounting data
+data/
+transactions/
+slips/
+uploads/
+*.db
+*.sqlite
+*.sqlite3
+
+# Editor and OS files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
