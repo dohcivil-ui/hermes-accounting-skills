@@ -94,3 +94,13 @@ recovery, expired-lease restart takeover, delivered replay suppression,
 incompatible Hermes adapter detection, and coexistence with non-Lekza Hermes
 callbacks. Prompts are asserted from durable state; Telegram and Google network
 APIs are not called.
+
+## Phase D staging acceptance
+
+Use `docs/PHASE_D_STAGING_RUNBOOK.md` only with designated Hostinger staging,
+Telegram test, AksonOCR test-authorized, and disposable Google resources. The
+staging guard must pass before service restart. Capture evidence for restart
+recovery, duplicate Confirm convergence, a staging-only failure and Retry,
+exactly one Sheets row, one reserved Drive identity, and terminal durable state.
+The post-interaction verifier must run in a fresh process with a minimum retry
+count of one. No Phase D command authorizes production deployment.

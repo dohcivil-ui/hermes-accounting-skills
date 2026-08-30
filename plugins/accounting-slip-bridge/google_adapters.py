@@ -184,6 +184,13 @@ class GoogleDriveAdapter(_GoogleRestAdapter):
                 return recovered
         raise GoogleAdapterError("Drive upload failed")
 
+    def verify_upload(self, transaction_id, file_id):
+        """Verify the durable file identity without creating or changing it."""
+        result = self._get_existing(file_id, str(uuid.UUID(str(transaction_id))))
+        if result is None:
+            raise GoogleAdapterError("Drive file is missing")
+        return result
+
     def _get_existing(self, file_id, transaction_id):
         response = self._session.get(
             f"{self.API}/files/{urllib.parse.quote(file_id, safe='')}",
@@ -290,6 +297,10 @@ class GoogleSheetsAdapter(_GoogleRestAdapter):
         if recovered is not None:
             return recovered
         raise GoogleAdapterError("Sheets append failed")
+
+    def find_transaction_row(self, transaction_id):
+        """Return the unique transaction row, failing if absent or duplicated."""
+        return self._find_row(str(uuid.UUID(str(transaction_id))), required=True)
 
     def _transactions_sheet_id(self):
         response = self._session.get(

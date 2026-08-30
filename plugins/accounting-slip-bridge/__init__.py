@@ -136,8 +136,7 @@ def register(ctx):
             log_entry = {
                 "hook_fired": True,
                 "platform": platform_val,
-                "media_urls": media_urls,
-                "media_types": media_types,
+                "media_count": len(media_urls or []),
                 "message_id": message_id
             }
             with open(log_file, "a", encoding="utf-8") as f:
@@ -198,6 +197,12 @@ def register(ctx):
                         ocr_result=ocr_res,
                     )
                     transaction_id = handoff["transaction"]["transaction_id"]
+                    with open(log_file, "a", encoding="utf-8") as f:
+                        f.write(json.dumps({
+                            "telegram_transaction_handoff": True,
+                            "transaction_id": transaction_id,
+                            "message_id": message_id,
+                        }, ensure_ascii=False) + "\n")
                 except Exception as exc:
                     handoff_error = str(exc)
                     with open(log_file, "a", encoding="utf-8") as f:

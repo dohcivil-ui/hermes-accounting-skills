@@ -52,6 +52,11 @@ def _controller_from_environment():
         google = _load_runtime_module(
             "lekza_google_adapters", bridge / "google_adapters.py"
         )
+        if str(os.environ.get("LEKZA_RUNTIME_ENV") or "").lower() == "staging":
+            guard = _load_runtime_module(
+                "lekza_staging_guard", bridge / "staging_guard.py"
+            )
+            guard.validate_staging_environment()
         try:
             projects = json.loads(os.environ.get("LEKZA_ACTIVE_PROJECTS_JSON", "[]"))
         except json.JSONDecodeError as exc:
@@ -81,6 +86,16 @@ def _controller_from_environment():
 def _set_controller_for_tests(controller):
     global _CONTROLLER
     _CONTROLLER = controller
+
+
+def _validate_staging_actor(chat_id, telegram_user_id):
+    if str(os.environ.get("LEKZA_RUNTIME_ENV") or "").lower() != "staging":
+        return
+    bridge = Path(__file__).resolve().parents[1] / "accounting-slip-bridge"
+    guard = _load_runtime_module(
+        "lekza_staging_guard", bridge / "staging_guard.py"
+    )
+    guard.validate_staging_actor(str(chat_id), str(telegram_user_id))
 
 
 def _validate_adapter_class(adapter_cls):
@@ -148,12 +163,15 @@ def _patch_module(mod_name, *, strict=False):
                 await answer(text="กำลังดำเนินการ")
                 answered = True
             message = getattr(query, "message", None)
+            chat_id = str(getattr(message, "chat_id", ""))
+            user_id = str(getattr(getattr(query, "from_user", None), "id", ""))
+            _validate_staging_actor(chat_id, user_id)
             result = await asyncio.to_thread(
                 _controller_from_environment().handle_callback,
                 data,
                 platform="telegram",
-                chat_id=str(getattr(message, "chat_id", "")),
-                telegram_user_id=str(getattr(getattr(query, "from_user", None), "id", "")),
+                chat_id=chat_id,
+                telegram_user_id=user_id,
             )
             if answer is not None and not answered:
                 await answer(
@@ -162,6 +180,7 @@ def _patch_module(mod_name, *, strict=False):
             if result.get("prompt"):
                 await _show_prompt(mod, query, result["prompt"])
         except Exception:
+            _LOG.exception("Lekza callback failed transaction_id=%s", data.split(":")[1] if ":" in data else "unknown")
             if answer is not None and not answered:
                 await answer(text="ไม่สามารถดำเนินการได้")
 
@@ -170,12 +189,15 @@ def _patch_module(mod_name, *, strict=False):
         text = getattr(message, "text", None)
         if text:
             try:
+                chat_id = str(getattr(message, "chat_id", ""))
+                user_id = str(getattr(getattr(message, "from_user", None), "id", ""))
+                _validate_staging_actor(chat_id, user_id)
                 result = await asyncio.to_thread(
                     _controller_from_environment().handle_manual_message,
                     text,
                     platform="telegram",
-                    chat_id=str(getattr(message, "chat_id", "")),
-                    telegram_user_id=str(getattr(getattr(message, "from_user", None), "id", "")),
+                    chat_id=chat_id,
+                    telegram_user_id=user_id,
                 )
                 if result is not None:
                     if result.get("prompt"):
@@ -301,6 +323,7 @@ def handoff_ocr_result(
     }
     if not actor["chat_id"] or not actor["telegram_user_id"]:
         raise ValueError("Telegram OCR handoff requires chat and user identity")
+    _validate_staging_actor(actor["chat_id"], actor["telegram_user_id"])
     tenant_id = str(os.environ.get("LEKZA_TENANT_ID") or actor["chat_id"])
     controller = _controller_from_environment()
     record = controller.begin_from_ocr(
@@ -312,6 +335,9 @@ def handoff_ocr_result(
         telegram_user_id=actor["telegram_user_id"],
         source_image_path=source_image_path,
         ocr_result=ocr_result,
+    )
+    _LOG.info(
+        "Lekza OCR handoff transaction_id=%s", record["transaction_id"]
     )
     claim = controller.acquire_initial_prompt_delivery(
         record["transaction_id"], **actor

@@ -199,6 +199,14 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(restarted.upload(self.transaction_id, self.slip, reserved), expected)
         self.assertEqual(session.uploads, 1)
 
+    def test_drive_read_back_verifies_reserved_identity_without_upload(self):
+        session = DriveSession()
+        adapter = self.adapters.GoogleDriveAdapter("folder-1", lambda: "token", session=session)
+        reserved = adapter.reserve_file_id()
+        expected = adapter.upload(self.transaction_id, self.slip, reserved)
+        self.assertEqual(adapter.verify_upload(self.transaction_id, reserved), expected)
+        self.assertEqual(session.uploads, 1)
+
     def test_drive_rejects_malformed_external_response(self):
         session = DriveSession()
         session.malformed_generate = True
@@ -233,6 +241,15 @@ class AdapterTests(unittest.TestCase):
         )
         self.assertEqual(session.batch_calls, 1)
         self.assertEqual(len(session.rows), 2)
+
+    def test_sheets_read_back_requires_exactly_one_matching_row(self):
+        session = SheetsSession(self.adapters)
+        adapter = self.adapters.GoogleSheetsAdapter("sheet-1", lambda: "token", session=session)
+        expected = adapter.append_transaction(self.transaction(), write_claim=self.claim())
+        self.assertEqual(adapter.find_transaction_row(self.transaction_id), expected)
+        session.rows.append(list(session.rows[-1]))
+        with self.assertRaisesRegex(self.adapters.GoogleAdapterError, "duplicated"):
+            adapter.find_transaction_row(self.transaction_id)
 
     def test_sheets_concurrent_loser_recovers_atomic_winner(self):
         session = SheetsSession(self.adapters)
