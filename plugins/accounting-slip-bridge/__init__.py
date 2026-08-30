@@ -185,6 +185,27 @@ def register(ctx):
                 parsed_fields = ocr_res.get("parsed", {})
                 usage = ocr_res.get("usage", {})
 
+                handoff_error = None
+                transaction_id = None
+                try:
+                    import lekza_accounting_transaction_buttons as telegram_buttons
+
+                    handoff = telegram_buttons.handoff_ocr_result(
+                        event,
+                        gateway,
+                        session_store,
+                        source_image_path=target_path,
+                        ocr_result=ocr_res,
+                    )
+                    transaction_id = handoff["transaction"]["transaction_id"]
+                except Exception as exc:
+                    handoff_error = str(exc)
+                    with open(log_file, "a", encoding="utf-8") as f:
+                        f.write(json.dumps({
+                            "telegram_transaction_handoff_failed": True,
+                            "error": handoff_error,
+                        }, ensure_ascii=False) + "\n")
+
                 rewrite_text = f"""[AksonOCR Slip Result]
 - OCR source: AksonOCR (Vision OCR is strictly prohibited for this slip)
 - confidence: {confidence}
@@ -192,6 +213,8 @@ def register(ctx):
 - parsed fields: {json.dumps(parsed_fields, ensure_ascii=False)}
 - usage: {json.dumps(usage, ensure_ascii=False)}
 - status: waiting_for_confirm
+- transaction_id: {transaction_id or "unavailable"}
+- telegram_buttons: {"scheduled" if transaction_id else "unavailable"}
 
 คำสั่งระบบสำหรับ Agent:
 1. ห้ามใช้ Vision อ่านสลิปซ้ำ ให้สรุปรายการจากผล AksonOCR ด้านบนเท่านั้น

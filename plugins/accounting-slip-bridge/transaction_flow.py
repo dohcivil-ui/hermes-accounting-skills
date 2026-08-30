@@ -7,6 +7,7 @@ existing OCR result, while later production adapters consume durable state.
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import hashlib
 import json
 import math
 import os
@@ -21,6 +22,7 @@ UPLOAD_ROOTS_ENV = "LEKZA_ALLOWED_UPLOAD_ROOTS"
 MAX_SLIP_BYTES_ENV = "LEKZA_MAX_SLIP_BYTES"
 DEFAULT_MAX_SLIP_BYTES = 10 * 1024 * 1024
 DEFAULT_SHEETS_LEASE_SECONDS = 120
+DEFAULT_PROMPT_LEASE_SECONDS = 120
 
 OCR_FIELDS = ("reference_no", "amount", "date", "payer", "payee", "note")
 ACTIVE_STATES = {
@@ -105,6 +107,16 @@ class SheetsWriteClaim:
         self._owner_check(self, minimum_valid_seconds=minimum_valid_seconds)
 
 
+class PromptDeliveryClaim:
+    """Capability identifying the current initial-prompt delivery owner."""
+
+    def __init__(self, transaction_id, owner_id, expires_at):
+        self.transaction_id = str(transaction_id)
+        self.owner_id = str(owner_id)
+        self.expires_at = str(expires_at)
+        self.active = True
+
+
 def _utc_now():
     return datetime.now(timezone.utc).isoformat()
 
@@ -161,6 +173,7 @@ class SQLiteStateStore:
                 chat_id TEXT NOT NULL,
                 thread_id TEXT,
                 session_id TEXT NOT NULL,
+                handoff_key TEXT,
                 telegram_user_id TEXT NOT NULL,
                 reference_no TEXT NOT NULL,
                 reference_no_normalized TEXT NOT NULL,
@@ -181,6 +194,11 @@ class SQLiteStateStore:
                 sheets_row_identity TEXT,
                 sheets_claim_owner TEXT,
                 sheets_claim_expires_at TEXT,
+                initial_prompt_state TEXT NOT NULL DEFAULT 'pending',
+                initial_prompt_owner TEXT,
+                initial_prompt_lease_expires_at TEXT,
+                initial_prompt_attempt_count INTEGER NOT NULL DEFAULT 0,
+                initial_prompt_message_id TEXT,
                 retry_count INTEGER NOT NULL DEFAULT 0,
                 retry_state TEXT,
                 last_error_code TEXT,
@@ -212,6 +230,12 @@ class SQLiteStateStore:
             "drive_upload_id": "TEXT",
             "sheets_claim_owner": "TEXT",
             "sheets_claim_expires_at": "TEXT",
+            "initial_prompt_state": "TEXT NOT NULL DEFAULT 'pending'",
+            "initial_prompt_owner": "TEXT",
+            "initial_prompt_lease_expires_at": "TEXT",
+            "initial_prompt_attempt_count": "INTEGER NOT NULL DEFAULT 0",
+            "initial_prompt_message_id": "TEXT",
+            "handoff_key": "TEXT",
         }
         for column, definition in migrations.items():
             if column in columns:
@@ -220,6 +244,22 @@ class SQLiteStateStore:
                 self._connection.execute(
                     f"ALTER TABLE transaction_state ADD COLUMN {column} {definition}"
                 )
+        with self._connection:
+            self._connection.execute(
+                """
+                UPDATE transaction_state
+                SET initial_prompt_state = 'delivered',
+                    initial_prompt_owner = NULL,
+                    initial_prompt_lease_expires_at = NULL
+                WHERE initial_prompt_message_id IS NOT NULL
+                """
+            )
+            self._connection.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS uq_transaction_handoff
+                ON transaction_state(handoff_key) WHERE handoff_key IS NOT NULL
+                """
+            )
 
     def create(self, record):
         columns = tuple(record)
@@ -232,6 +272,10 @@ class SQLiteStateStore:
             with self._connection:
                 self._connection.execute(sql, tuple(record[column] for column in columns))
         except sqlite3.IntegrityError as exc:
+            if "handoff_key" in str(exc) and record.get("handoff_key"):
+                existing = self.get_by_handoff(record["handoff_key"])
+                if existing is not None:
+                    return existing
             if "reference_no_normalized" in str(exc):
                 raise DuplicateReferenceError(
                     "Reference number already exists for this tenant"
@@ -255,6 +299,182 @@ class SQLiteStateStore:
             (str(tenant_id), _normalize_reference(reference_no)),
         ).fetchone()
         return self._decode(row) if row is not None else None
+
+    def get_by_handoff(self, handoff_key):
+        row = self._connection.execute(
+            "SELECT * FROM transaction_state WHERE handoff_key = ?",
+            (str(handoff_key),),
+        ).fetchone()
+        return self._decode(row) if row is not None else None
+
+    def get_manual_pending(self, *, platform, chat_id, telegram_user_id):
+        rows = self._connection.execute(
+            """
+            SELECT * FROM transaction_state
+            WHERE platform = ? AND chat_id = ? AND telegram_user_id = ?
+              AND current_state IN ('waiting_project', 'waiting_category')
+              AND entry_mode IS NOT NULL
+            ORDER BY updated_at DESC
+            LIMIT 2
+            """,
+            (str(platform), str(chat_id), str(telegram_user_id)),
+        ).fetchall()
+        if len(rows) > 1:
+            raise TransactionStateError("Multiple manual inputs are pending")
+        return self._decode(rows[0]) if rows else None
+
+    def acquire_initial_prompt_delivery(
+        self,
+        transaction_id,
+        *,
+        platform,
+        chat_id,
+        telegram_user_id,
+        lease_seconds=DEFAULT_PROMPT_LEASE_SECONDS,
+    ):
+        """Acquire a recoverable lease and commit before Telegram I/O."""
+        lease_seconds = float(lease_seconds)
+        if lease_seconds <= 0:
+            raise ValueError("Prompt delivery lease duration must be positive")
+        connection = sqlite3.connect(str(self.path), timeout=10)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA busy_timeout=10000")
+        now = datetime.now(timezone.utc)
+        owner_id = str(uuid.uuid4())
+        expires_at = (now + timedelta(seconds=lease_seconds)).isoformat()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT platform, chat_id, telegram_user_id,
+                       initial_prompt_state, initial_prompt_owner,
+                       initial_prompt_lease_expires_at,
+                       initial_prompt_message_id
+                FROM transaction_state WHERE transaction_id = ?
+                """,
+                (str(transaction_id),),
+            ).fetchone()
+            if row is None:
+                raise KeyError("Transaction not found")
+            owner = (row["platform"], row["chat_id"], row["telegram_user_id"])
+            actor = (str(platform), str(chat_id), str(telegram_user_id))
+            if owner != actor:
+                raise AuthorizationError("Transaction actor is not authorized")
+            if (
+                row["initial_prompt_state"] == "delivered"
+                or row["initial_prompt_message_id"]
+            ):
+                connection.commit()
+                return None
+            current_owner = str(row["initial_prompt_owner"] or "").strip()
+            current_expiry = str(
+                row["initial_prompt_lease_expires_at"] or ""
+            ).strip()
+            if current_owner and current_expiry:
+                try:
+                    expiry = datetime.fromisoformat(current_expiry)
+                except ValueError:
+                    expiry = now
+                if expiry.tzinfo is None:
+                    expiry = expiry.replace(tzinfo=timezone.utc)
+                if expiry > now:
+                    connection.commit()
+                    return None
+            cursor = connection.execute(
+                """
+                UPDATE transaction_state
+                SET initial_prompt_state = 'delivering',
+                    initial_prompt_owner = ?,
+                    initial_prompt_lease_expires_at = ?,
+                    initial_prompt_attempt_count = initial_prompt_attempt_count + 1,
+                    updated_at = ?
+                WHERE transaction_id = ?
+                """,
+                (owner_id, expires_at, now.isoformat(), str(transaction_id)),
+            )
+            if cursor.rowcount != 1:
+                raise StaleStateError("Initial prompt delivery claim was lost")
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+        return PromptDeliveryClaim(transaction_id, owner_id, expires_at)
+
+    def release_initial_prompt_delivery(self, claim):
+        if not claim.active:
+            return
+        with self._connection:
+            self._connection.execute(
+                """
+                UPDATE transaction_state
+                SET initial_prompt_state = 'pending',
+                    initial_prompt_owner = NULL,
+                    initial_prompt_lease_expires_at = NULL,
+                    updated_at = ?
+                WHERE transaction_id = ?
+                  AND initial_prompt_state = 'delivering'
+                  AND initial_prompt_owner = ?
+                """,
+                (_utc_now(), claim.transaction_id, claim.owner_id),
+            )
+        claim.active = False
+
+    def complete_initial_prompt(
+        self,
+        claim,
+        *,
+        platform,
+        chat_id,
+        telegram_user_id,
+        message_id,
+    ):
+        safe_message_id = str(message_id or "").strip()
+        if not safe_message_id:
+            raise ValueError("Telegram prompt result requires message_id")
+        with self._connection:
+            cursor = self._connection.execute(
+                """
+                UPDATE transaction_state
+                SET initial_prompt_state = 'delivered',
+                    initial_prompt_owner = NULL,
+                    initial_prompt_lease_expires_at = NULL,
+                    initial_prompt_message_id = ?, updated_at = ?
+                WHERE transaction_id = ?
+                  AND platform = ? AND chat_id = ? AND telegram_user_id = ?
+                  AND initial_prompt_state = 'delivering'
+                  AND initial_prompt_owner = ?
+                  AND initial_prompt_message_id IS NULL
+                """,
+                (
+                    safe_message_id,
+                    _utc_now(),
+                    claim.transaction_id,
+                    str(platform),
+                    str(chat_id),
+                    str(telegram_user_id),
+                    claim.owner_id,
+                ),
+            )
+        if cursor.rowcount != 1:
+            record = self.get(claim.transaction_id)
+            if record is None:
+                raise KeyError("Transaction not found")
+            owner = (
+                record["platform"],
+                record["chat_id"],
+                record["telegram_user_id"],
+            )
+            actor = (str(platform), str(chat_id), str(telegram_user_id))
+            if owner != actor:
+                raise AuthorizationError("Transaction actor is not authorized")
+            if record.get("initial_prompt_message_id") == safe_message_id:
+                claim.active = False
+                return record
+            raise StaleStateError("Initial Telegram prompt claim is not active")
+        claim.active = False
+        return self.get(claim.transaction_id)
 
     def acquire_sheets_write_claim(
         self,
@@ -507,6 +727,7 @@ class TransactionFlow:
         chat_id,
         thread_id,
         session_id,
+        handoff_key=None,
         telegram_user_id,
         source_image_path,
         ocr_result,
@@ -536,6 +757,7 @@ class TransactionFlow:
                 "chat_id": str(chat_id),
                 "thread_id": None if thread_id is None else str(thread_id),
                 "session_id": str(session_id),
+                "handoff_key": None if handoff_key is None else str(handoff_key),
                 "telegram_user_id": str(telegram_user_id),
                 "reference_no": reference_no,
                 "reference_no_normalized": reference_key,
@@ -551,6 +773,61 @@ class TransactionFlow:
         )
         return self._view(record)
 
+    def begin_or_recover(self, **handoff):
+        """Create once, or recover the same retried Telegram/OCR handoff."""
+        handoff = dict(handoff)
+        handoff_id = str(handoff.pop("handoff_id", "") or "")
+        source_path = str(self._validate_source_path(handoff["source_image_path"]))
+        identity = {
+            "platform": str(handoff["platform"]),
+            "chat_id": str(handoff["chat_id"]),
+            "telegram_user_id": str(handoff["telegram_user_id"]),
+            "handoff_id": handoff_id,
+        }
+        if not handoff_id:
+            identity.update({
+                "thread_id": None
+                if handoff.get("thread_id") is None
+                else str(handoff["thread_id"]),
+                "session_id": str(handoff["session_id"]),
+                "source_image_path": source_path,
+            })
+        handoff_key = hashlib.sha256(
+            json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        existing_handoff = self._store.get_by_handoff(handoff_key)
+        if existing_handoff is not None:
+            return self._view(existing_handoff)
+        handoff = dict(handoff, handoff_key=handoff_key)
+        try:
+            return self.begin(**handoff)
+        except DuplicateReferenceError:
+            parsed = dict((handoff.get("ocr_result") or {}).get("parsed") or {})
+            existing = self._store.get_by_reference(
+                handoff["tenant_id"], parsed.get("reference_no")
+            )
+            if existing is None:
+                raise
+            expected = (
+                str(handoff["platform"]),
+                str(handoff["chat_id"]),
+                None if handoff.get("thread_id") is None else str(handoff["thread_id"]),
+                str(handoff["session_id"]),
+                str(handoff["telegram_user_id"]),
+                source_path,
+            )
+            actual = (
+                existing["platform"],
+                existing["chat_id"],
+                existing["thread_id"],
+                existing["session_id"],
+                existing["telegram_user_id"],
+                existing["source_image_path"],
+            )
+            if actual != expected:
+                raise
+            return self._view(existing)
+
     def get_transaction(
         self, transaction_id, *, platform, chat_id, telegram_user_id
     ):
@@ -558,6 +835,54 @@ class TransactionFlow:
             transaction_id, platform, chat_id, telegram_user_id
         )
         return dict(record)
+
+    def get_manual_pending(self, *, platform, chat_id, telegram_user_id):
+        return self._store.get_manual_pending(
+            platform=platform,
+            chat_id=chat_id,
+            telegram_user_id=telegram_user_id,
+        )
+
+    def acquire_initial_prompt_delivery(
+        self,
+        transaction_id,
+        *,
+        platform,
+        chat_id,
+        telegram_user_id,
+        lease_seconds=DEFAULT_PROMPT_LEASE_SECONDS,
+    ):
+        self._require_authorized(transaction_id, platform, chat_id, telegram_user_id)
+        return self._store.acquire_initial_prompt_delivery(
+            transaction_id,
+            platform=platform,
+            chat_id=chat_id,
+            telegram_user_id=telegram_user_id,
+            lease_seconds=lease_seconds,
+        )
+
+    def release_initial_prompt_delivery(self, claim):
+        self._store.release_initial_prompt_delivery(claim)
+
+    def complete_initial_prompt(
+        self,
+        claim,
+        *,
+        platform,
+        chat_id,
+        telegram_user_id,
+        message_id,
+    ):
+        self._require_authorized(
+            claim.transaction_id, platform, chat_id, telegram_user_id
+        )
+        return self._store.complete_initial_prompt(
+            claim,
+            platform=platform,
+            chat_id=chat_id,
+            telegram_user_id=telegram_user_id,
+            message_id=message_id,
+        )
 
     def claim_sheets_write(
         self,
@@ -934,6 +1259,17 @@ class TransactionFlow:
         }:
             raise InvalidTransitionError("Back is not available from this state")
         if not record["history"]:
+            if record.get("entry_mode"):
+                updated = self._store.transition(
+                    transaction_id,
+                    platform=platform,
+                    chat_id=chat_id,
+                    telegram_user_id=telegram_user_id,
+                    expected_version=expected_version,
+                    allowed_from={record["current_state"]},
+                    changes={"entry_mode": None},
+                )
+                return self._view(updated)
             return self._view(record)
         history = list(record["history"])
         previous_state = history.pop()
@@ -947,6 +1283,7 @@ class TransactionFlow:
             changes={
                 "current_state": previous_state,
                 "history_json": json.dumps(history),
+                "entry_mode": None,
             },
         )
         return self._view(updated)

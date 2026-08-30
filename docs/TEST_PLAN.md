@@ -83,3 +83,14 @@ python -m unittest tests.live.test_google_adapters_live -v
 The smoke test is skipped unless explicitly enabled. It rejects test resource
 IDs that equal configured production IDs, writes only a synthetic one-baht row
 and synthetic image, and reuses its persistent test state on rerun.
+
+## Phase C Telegram acceptance
+
+Synthetic integration tests cover compact callback identity, project/user/type/
+category selection, Back, Cancel, Confirm, Retry, duplicate Confirm delivery,
+stale versions, wrong users, manual entry, process restart, malformed payloads,
+the image/OCR-to-durable-state handoff, prompt delivery before/after-send crash
+recovery, expired-lease restart takeover, delivered replay suppression,
+incompatible Hermes adapter detection, and coexistence with non-Lekza Hermes
+callbacks. Prompts are asserted from durable state; Telegram and Google network
+APIs are not called.

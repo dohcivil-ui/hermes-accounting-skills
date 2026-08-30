@@ -15,8 +15,9 @@ Telegram image
   -> AksonOCR /api/v2/upload
   -> durable TransactionFlow state created from the existing OCR result
   -> Hermes rewrite with parsed fields and confidence
-  -> future Telegram callback wiring and user confirmation
-  -> future Google Drive upload and Google Sheets append adapters
+  -> accounting-transaction-buttons durable Telegram callbacks
+  -> user confirmation
+  -> Google Drive upload and Google Sheets append adapters
 ```
 
 `accounting-slip-bridge` is the single OCR owner. `TransactionFlow` accepts an
@@ -29,7 +30,9 @@ existing OCR result and does not contain an OCR client or make network calls.
 - `skills/accounting/process-slip-pipeline/scripts/process_slip.py`: command-line AksonOCR adapter used by the image trigger.
 - `plugins/accounting-slip-bridge`: gateway hook that selects Telegram media, calls AksonOCR, and rewrites the agent input.
 - `plugins/accounting-slip-bridge/transaction_flow.py`: SQLite-backed pending state, authorized state transitions, and durable Drive/Sheets checkpoints.
-- `plugins/accounting-slip-bridge/google_adapters.py`: production Google REST adapters and the restart-safe save coordinator; Telegram callbacks do not instantiate these adapters yet.
+- `plugins/accounting-slip-bridge/google_adapters.py`: production Google REST adapters and the restart-safe save coordinator.
+- `plugins/accounting-slip-bridge/telegram_wiring.py`: state-derived Telegram prompts and strict callback identities; it owns no OCR or session state.
+- `plugins/accounting-transaction-buttons`: lazy Telegram adapter patch that routes Lekza callbacks and manual text to the durable controller while delegating all unrelated callbacks to Hermes.
 - `plugins/telegram-clarify-pretty`: presentation layer for Telegram clarification buttons.
 - Other accounting skills: confirmation, CRUD, multi-user context, reporting, and conversational policy.
 
@@ -103,3 +106,39 @@ remaining lease time to exceed the HTTP timeout. A crashed worker leaves a
 short-lived lease; after expiry, its replacement takes ownership and searches
 column A for `transaction_id` before deciding whether to append. Leases are per
 transaction, so unrelated transactions do not wait for each other's network I/O.
+
+## Telegram callback identity
+
+Phase C callback data is `lk:<transaction-uuid-hex>:<base36-version>:<action>`;
+project selections add a deterministic 12-character project token. Payloads are
+strictly parsed and remain within Telegram's 64-byte limit. The full transaction
+UUID is the callback identity and the durable row version rejects stale buttons.
+
+The Telegram adapter is patched lazily after it is loaded. Every prompt is
+rendered from SQLite, and manual input is located by actor and durable entry
+mode, so callbacks and manual-entry steps survive process restarts. Confirm and
+Retry call the production save coordinator, whose Drive reservation and Sheets
+lease make external retries idempotent. OCR remains owned only by
+`accounting-slip-bridge`.
+
+After the existing AksonOCR success branch returns parsed fields,
+`accounting-slip-bridge` hands that result to the button plugin. A hash of the
+Telegram chat, actor, and stable inbound message ID is the durable handoff key,
+so replay after restart recovers the same transaction even if the local media
+cache path changes. An atomic SQLite
+lease records `pending`/`delivering`/`delivered`, owner, expiry, attempt count,
+and the delivered Telegram `message_id`. The lease transaction commits before
+Telegram network I/O and an expired worker can be replaced after restart. A
+delivered prompt is not normally sent again. Prompt delivery metadata does not
+increment the callback version.
+
+Telegram provides no true idempotency key. If Telegram accepts a prompt and the
+worker crashes before persisting its `message_id`, lease takeover deliberately
+uses at-least-once delivery and may rarely produce a duplicate. This favors
+recovering a visible prompt over permanently suppressing it.
+
+The button plugin validates that Hermes exposes callable
+`_handle_callback_query` and `_handle_text_message` handlers before changing the
+adapter class. An incompatible adapter is left untouched and emits an explicit
+diagnostic. Callback data outside the `lk:` namespace always delegates to the
+original Hermes callback handler.
