@@ -1,18 +1,19 @@
 ---
 name: process-slip-pipeline
 description: Use when processing bank slip images from Telegram via AksonOCR script.
-platforms: [telegram]
-triggers:
-  - type: image
-    handler: python3 /data/skills/accounting/process-slip-pipeline/scripts/process_slip.py
+platforms: [linux]
+metadata:
+  hermes:
+    category: accounting
+    tags: [telegram, accounting, slips, aksonocr]
 ---
 
 # Process Slip Pipeline (AksonOCR-First)
 
 ## Mandatory Execution & Implementation
-1. **Script Path**: `/data/skills/accounting/process-slip-pipeline/scripts/process_slip.py`
+1. **Script Path**: `$HERMES_HOME/skills/accounting/process-slip-pipeline/scripts/process_slip.py`
 2. **HTTP Endpoint**: `https://backend.aksonocr.com/api/v2/upload`
-3. **Environment**: Uses `AKSONOCR_API_KEY` from container environment.
+3. **Environment**: Uses `AKSONOCR_API_KEY` from the selected Hermes runtime environment.
 4. **Execution Flow**:
    - When a Telegram image is received, the gateway maps the image attachment path and passes it to `process_slip.py`.
    - `process_slip.py` performs the HTTP POST request to AksonOCR.

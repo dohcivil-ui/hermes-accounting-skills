@@ -3,7 +3,11 @@ name: scheduled-project-report
 description: "Use for timed reports: daily/weekly/monthly by project."
 version: 1.0.0
 author: Lekza (Hermes Agent)
-platforms: [telegram]
+platforms: [linux]
+metadata:
+  hermes:
+    category: accounting
+    tags: [telegram, accounting, reporting, scheduled]
 ---
 
 # scheduled-project-report

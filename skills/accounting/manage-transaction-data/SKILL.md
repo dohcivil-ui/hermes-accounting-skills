@@ -3,7 +3,11 @@ name: manage-transaction-data
 description: "Use for CRUD on jobs/transactions. Confirm before write."
 version: 1.0.0
 author: Lekza (Hermes Agent)
-platforms: [telegram]
+platforms: [linux]
+metadata:
+  hermes:
+    category: accounting
+    tags: [telegram, accounting, transactions, crud]
 ---
 
 # manage-transaction-data
