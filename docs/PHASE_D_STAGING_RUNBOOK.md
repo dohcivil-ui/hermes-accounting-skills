@@ -104,11 +104,14 @@ Gate D1 plus verified path substitutions immediately before execution.
    `slip_url`, and terminal state.
 7. Deliver the same Confirm callback again; it must converge without a second
    Drive object or Sheets row.
-8. For the network/API failure case, use a separately reviewed staging-only
-   fault (for example, temporarily revoke the test spreadsheet permission),
-   Confirm, observe `failed`, restore permission, and press Retry. Never alter
-   production permissions.
-9. Restart staging again and run the verifier in a fresh process:
+8. For the network/API failure case, send a third uniquely referenced synthetic
+   slip and advance it to review. Before its first Confirm, use a separately
+   reviewed staging-only fault (for example, temporarily revoke the test
+   spreadsheet permission). Confirm, observe `failed`, restore permission, and
+   press Retry. Never alter production permissions. Verify the retried
+   transaction has one Drive identity and exactly one Sheets row.
+9. Restart staging again and run the verifier for the retried transaction in a
+   fresh process:
 
 ```text
 python3 <staging-plugins-path>/accounting-slip-bridge/phase_d_smoke.py \
@@ -120,7 +123,16 @@ The verifier replays the save twice, checks terminal durable state, verifies the
 reserved Drive identity, and fails if the transaction is absent or duplicated
 in Sheets column A.
 
-10. Rehearse rollback using the recorded previous staging artifact and
+10. Verify fail-closed behavior with a synthetic image from a deliberately
+    non-allowlisted staging test identity. Confirm that dispatch is skipped and
+    that no media download, AksonOCR request, transaction, Drive object, or
+    Sheets row is created. Separately run `staging_guard.py` in an isolated
+    subprocess environment with one required non-secret acknowledgement omitted
+    and confirm it exits unsuccessfully before integration work; do not alter
+    the running service environment. Restore the approved test identity and
+    capture only sanitized evidence.
+
+11. Rehearse rollback using the recorded previous staging artifact and
     configuration. Restore the pre-deploy SQLite backup only if the previous
     artifact cannot read the upgraded staging state; retain a separate copy of
     the failed-run database and logs first. Restart staging, run the previous
