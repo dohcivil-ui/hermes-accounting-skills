@@ -31,3 +31,9 @@ class RuntimeLayoutTests(unittest.TestCase):
 
     def test_old_accounting_layout_is_absent(self):
         self.assertFalse((ROOT / "accounting").exists())
+
+    def test_process_slip_skill_uses_production_runtime_path(self):
+        skill = ROOT / "skills/accounting/process-slip-pipeline/SKILL.md"
+        text = skill.read_text(encoding="utf-8")
+        runtime_path = "/data/skills/accounting/process-slip-pipeline/scripts/process_slip.py"
+        self.assertIn(runtime_path, text)

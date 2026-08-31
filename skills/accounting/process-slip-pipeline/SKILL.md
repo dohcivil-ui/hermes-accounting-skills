@@ -11,7 +11,7 @@ metadata:
 # Process Slip Pipeline (AksonOCR-First)
 
 ## Mandatory Execution & Implementation
-1. **Script Path**: `$HERMES_HOME/skills/accounting/process-slip-pipeline/scripts/process_slip.py`
+1. **Script Path**: `/data/skills/accounting/process-slip-pipeline/scripts/process_slip.py`
 2. **HTTP Endpoint**: `https://backend.aksonocr.com/api/v2/upload`
 3. **Environment**: Uses `AKSONOCR_API_KEY` from the selected Hermes runtime environment.
 4. **Execution Flow**:
