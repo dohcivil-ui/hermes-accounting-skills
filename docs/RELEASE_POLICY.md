@@ -23,6 +23,10 @@ Codex change
 
 Lekza uses Semantic Versioning:
 
+The project release version is the Git tag on `main`. Versions in individual
+skill frontmatter and plugin manifests are component metadata and are scoped
+independently; they do not replace or need to match the project release tag.
+
 - `v0.1.0` — Hostinger Runtime Baseline.
 - `v0.2.0` — Telegram Button Flow + Transactional Save.
 - `v0.3.0` — Project Summary + Close Job.
