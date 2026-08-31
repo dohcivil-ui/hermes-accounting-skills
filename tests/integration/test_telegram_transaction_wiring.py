@@ -509,7 +509,7 @@ class TelegramTransactionWiringTests(unittest.TestCase):
         )
         event = types.SimpleNamespace(
             source=source,
-            media_urls=[str(self.slip)],
+            media_urls=["https://example.invalid/synthetic-slip.jpg"],
             media_types=["image/jpeg"],
             message_id="image-message-1",
         )
@@ -567,6 +567,12 @@ class TelegramTransactionWiringTests(unittest.TestCase):
 
         try:
             with patch.dict(os.environ, {"LEKZA_RUNTIME_ENV": "production"}), \
+                    patch.object(
+                        bridge,
+                        "_materialize_media",
+                        side_effect=lambda value: str(self.slip)
+                        if value.startswith("https://") else value,
+                    ), \
                     patch.object(bridge, "call_akson_ocr", return_value=ocr_result), \
                     patch.object(bridge.os, "makedirs"), \
                     patch("builtins.open", mock_open()):
