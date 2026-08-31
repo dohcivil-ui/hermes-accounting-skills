@@ -17,7 +17,11 @@ class RuntimeLayoutTests(unittest.TestCase):
             "skills/accounting/query-payee-summary/SKILL.md",
             "skills/accounting/scheduled-project-report/SKILL.md",
             "plugins/accounting-slip-bridge/__init__.py",
+            "plugins/accounting-slip-bridge/transaction_flow.py",
+            "plugins/accounting-slip-bridge/telegram_wiring.py",
             "plugins/accounting-slip-bridge/plugin.yaml",
+            "plugins/accounting-transaction-buttons/__init__.py",
+            "plugins/accounting-transaction-buttons/plugin.yaml",
             "plugins/telegram-clarify-pretty/__init__.py",
             "plugins/telegram-clarify-pretty/plugin.yaml",
         ]
@@ -27,3 +31,9 @@ class RuntimeLayoutTests(unittest.TestCase):
 
     def test_old_accounting_layout_is_absent(self):
         self.assertFalse((ROOT / "accounting").exists())
+
+    def test_process_slip_skill_uses_production_runtime_path(self):
+        skill = ROOT / "skills/accounting/process-slip-pipeline/SKILL.md"
+        text = skill.read_text(encoding="utf-8")
+        runtime_path = "/data/skills/accounting/process-slip-pipeline/scripts/process_slip.py"
+        self.assertIn(runtime_path, text)

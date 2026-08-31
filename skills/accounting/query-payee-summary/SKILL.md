@@ -3,7 +3,11 @@ name: query-payee-summary
 description: "Use when asked for payee/payer totals. Sum, count, detail."
 version: 1.0.0
 author: Lekza (Hermes Agent)
-platforms: [telegram]
+platforms: [linux]
+metadata:
+  hermes:
+    category: accounting
+    tags: [telegram, accounting, reporting, payee]
 ---
 
 # query-payee-summary

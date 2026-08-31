@@ -1,0 +1,4 @@
+name: accounting-transaction-buttons
+version: 1.0.0
+description: Durable Telegram inline-button wiring for Lekza transaction state.
+entrypoint: __init__.py

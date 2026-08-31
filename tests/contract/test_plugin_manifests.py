@@ -11,7 +11,7 @@ class PluginManifestTests(unittest.TestCase):
     def test_manifests_match_plugin_directories(self):
         failures = []
         manifests = sorted(PLUGINS_ROOT.glob("*/plugin.yaml"))
-        self.assertEqual(len(manifests), 2)
+        self.assertEqual(len(manifests), 3)
 
         for manifest in manifests:
             text = manifest.read_text(encoding="utf-8")

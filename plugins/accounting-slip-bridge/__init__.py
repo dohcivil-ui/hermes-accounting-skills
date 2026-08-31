@@ -3,6 +3,96 @@ import sys
 import json
 import requests
 import urllib.parse
+import importlib.util
+import tempfile
+from pathlib import Path
+
+
+_STAGING_GUARD = None
+
+
+def _staging_guard():
+    global _STAGING_GUARD
+    if _STAGING_GUARD is None:
+        path = os.path.join(os.path.dirname(__file__), "staging_guard.py")
+        spec = importlib.util.spec_from_file_location("lekza_slip_staging_guard", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _STAGING_GUARD = module
+    return _STAGING_GUARD
+
+
+def _telegram_bot_id(gateway):
+    adapters = getattr(gateway, "adapters", None)
+    if isinstance(adapters, dict):
+        for key, adapter in adapters.items():
+            platform = getattr(key, "value", key)
+            if str(platform).lower() == "telegram":
+                bot = getattr(adapter, "_bot", None) or getattr(adapter, "bot", None)
+                return str(getattr(bot, "id", "") or "")
+    return ""
+
+
+def _authorize_runtime_actor(source, gateway):
+    guard = _staging_guard()
+    mode = guard.validate_runtime_environment()
+    if mode == "staging":
+        guard.validate_staging_ocr_actor(
+            _telegram_bot_id(gateway),
+            str(getattr(source, "chat_id", "") or ""),
+            str(getattr(source, "user_id", "") or ""),
+        )
+
+
+def _materialize_media(image_path_or_url):
+    """Return a durable local image path, downloading remote Telegram media."""
+    value = str(image_path_or_url)
+    if value.startswith("file://"):
+        return urllib.parse.unquote(value[7:])
+    if not value.startswith(("http://", "https://")):
+        return value
+
+    roots_value = str(os.environ.get("LEKZA_ALLOWED_UPLOAD_ROOTS") or "").strip()
+    roots = [item.strip() for item in roots_value.split(os.pathsep) if item.strip()]
+    if not roots:
+        raise ValueError("LEKZA_ALLOWED_UPLOAD_ROOTS is required for remote media")
+    root = Path(roots[0]).expanduser()
+    if not root.is_absolute():
+        raise ValueError("LEKZA_ALLOWED_UPLOAD_ROOTS must contain absolute paths")
+    root.mkdir(parents=True, exist_ok=True)
+    root = root.resolve(strict=True)
+
+    response = requests.get(value, timeout=30)
+    if response.status_code != 200:
+        raise RuntimeError(
+            f"Failed to download Telegram media: status {response.status_code}"
+        )
+    content = response.content
+    max_bytes = int(os.environ.get("LEKZA_MAX_SLIP_BYTES", 10 * 1024 * 1024))
+    if not content or len(content) > max_bytes:
+        raise ValueError("Downloaded Telegram media size is not allowed")
+    if content.startswith(b"\xff\xd8\xff"):
+        suffix = ".jpg"
+    elif content.startswith(b"\x89PNG\r\n\x1a\n"):
+        suffix = ".png"
+    elif len(content) >= 12 and content[:4] == b"RIFF" and content[8:12] == b"WEBP":
+        suffix = ".webp"
+    else:
+        raise ValueError("Downloaded Telegram media type is not allowed")
+
+    fd, local_path = tempfile.mkstemp(
+        prefix="telegram-slip-", suffix=suffix, dir=str(root)
+    )
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(content)
+    except Exception:
+        try:
+            os.remove(local_path)
+        except OSError:
+            pass
+        raise
+    return local_path
 
 def call_akson_ocr(image_path_or_url):
     api_key = os.getenv("AKSONOCR_API_KEY")
@@ -96,6 +186,9 @@ def call_akson_ocr(image_path_or_url):
 
 def register(ctx):
     def pre_gateway_dispatch_hook(event, gateway=None, session_store=None, **kwargs):
+        downloaded_media = False
+        target_path = None
+        durable_handoff = False
         try:
             # 2. Platform from event.source.platform (handle Enum / string)
             source = getattr(event, "source", None)
@@ -128,22 +221,7 @@ def register(ctx):
             if message_id is None and isinstance(event, dict):
                 message_id = event.get("message_id")
 
-            # 4. Diagnostic log before checking platform (no API key)
-            log_dir = "/data/logs"
-            os.makedirs(log_dir, exist_ok=True)
-            log_file = os.path.join(log_dir, "accounting-slip-bridge.log")
-
-            log_entry = {
-                "hook_fired": True,
-                "platform": platform_val,
-                "media_urls": media_urls,
-                "media_types": media_types,
-                "message_id": message_id
-            }
-            with open(log_file, "a", encoding="utf-8") as f:
-                f.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
-
-            # 5. Check if platform is telegram
+            # 4. Check if platform is telegram
             if platform_val != "telegram":
                 return None
 
@@ -160,9 +238,24 @@ def register(ctx):
             if not chosen_media:
                 return None
 
-            target_path = chosen_media
-            if target_path.startswith("file://"):
-                target_path = urllib.parse.unquote(target_path[7:])
+            # Authorization and runtime selection must complete before logging,
+            # media download, OCR, or any other integration side effect.
+            _authorize_runtime_actor(source, gateway)
+
+            log_dir = "/data/logs"
+            os.makedirs(log_dir, exist_ok=True)
+            log_file = os.path.join(log_dir, "accounting-slip-bridge.log")
+            log_entry = {
+                "hook_fired": True,
+                "platform": platform_val,
+                "media_count": len(media_urls or []),
+                "message_id": message_id
+            }
+            with open(log_file, "a", encoding="utf-8") as f:
+                f.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
+
+            downloaded_media = str(chosen_media).startswith(("http://", "https://"))
+            target_path = _materialize_media(chosen_media)
 
             ocr_res = call_akson_ocr(target_path)
             
@@ -170,7 +263,7 @@ def register(ctx):
             ocr_log = {
                 "hook_fired": True,
                 "platform": platform_val,
-                "chosen_media": chosen_media,
+                "media_is_remote": str(chosen_media).startswith(("http://", "https://")),
                 "akson_called": ocr_res.get("akson_called", False),
                 "confidence": ocr_res.get("confidence"),
                 "http_status": ocr_res.get("http_status"),
@@ -185,6 +278,39 @@ def register(ctx):
                 parsed_fields = ocr_res.get("parsed", {})
                 usage = ocr_res.get("usage", {})
 
+                handoff_error = None
+                transaction_id = None
+                try:
+                    import lekza_accounting_transaction_buttons as telegram_buttons
+
+                    handoff = telegram_buttons.handoff_ocr_result(
+                        event,
+                        gateway,
+                        session_store,
+                        source_image_path=target_path,
+                        ocr_result=ocr_res,
+                    )
+                    transaction_id = handoff["transaction"]["transaction_id"]
+                    durable_handoff = True
+                    with open(log_file, "a", encoding="utf-8") as f:
+                        f.write(json.dumps({
+                            "telegram_transaction_handoff": True,
+                            "transaction_id": transaction_id,
+                            "message_id": message_id,
+                        }, ensure_ascii=False) + "\n")
+                except Exception as exc:
+                    handoff_error = type(exc).__name__
+                    with open(log_file, "a", encoding="utf-8") as f:
+                        f.write(json.dumps({
+                            "telegram_transaction_handoff_failed": True,
+                            "error_type": handoff_error,
+                        }, ensure_ascii=False) + "\n")
+                    if downloaded_media and not durable_handoff:
+                        try:
+                            os.remove(target_path)
+                        except OSError:
+                            pass
+
                 rewrite_text = f"""[AksonOCR Slip Result]
 - OCR source: AksonOCR (Vision OCR is strictly prohibited for this slip)
 - confidence: {confidence}
@@ -192,6 +318,8 @@ def register(ctx):
 - parsed fields: {json.dumps(parsed_fields, ensure_ascii=False)}
 - usage: {json.dumps(usage, ensure_ascii=False)}
 - status: waiting_for_confirm
+- transaction_id: {transaction_id or "unavailable"}
+- telegram_buttons: {"scheduled" if transaction_id else "unavailable"}
 
 คำสั่งระบบสำหรับ Agent:
 1. ห้ามใช้ Vision อ่านสลิปซ้ำ ให้สรุปรายการจากผล AksonOCR ด้านบนเท่านั้น
@@ -204,14 +332,30 @@ def register(ctx):
                     "text": rewrite_text
                 }
 
+            if downloaded_media:
+                try:
+                    os.remove(target_path)
+                except OSError:
+                    pass
+            return {"action": "skip"}
+
         except Exception as e:
+            if downloaded_media and target_path and not durable_handoff:
+                try:
+                    os.remove(target_path)
+                except OSError:
+                    pass
             try:
                 log_dir = "/data/logs"
                 os.makedirs(log_dir, exist_ok=True)
                 with open(os.path.join(log_dir, "accounting-slip-bridge.log"), "a", encoding="utf-8") as f:
-                    f.write(json.dumps({"error": str(e)}, ensure_ascii=False) + "\n")
+                    f.write(json.dumps({
+                        "error": "accounting slip processing failed",
+                        "error_type": type(e).__name__,
+                    }, ensure_ascii=False) + "\n")
             except Exception:
                 pass
+            return {"action": "skip"}
 
         return None
 
