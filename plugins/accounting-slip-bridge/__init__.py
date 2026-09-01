@@ -44,41 +44,103 @@ def _authorize_runtime_actor(source, gateway):
         )
 
 
-def _materialize_media(image_path_or_url):
-    """Return a durable local image path, downloading remote Telegram media."""
-    value = str(image_path_or_url)
-    if value.startswith("file://"):
-        return urllib.parse.unquote(value[7:])
-    if not value.startswith(("http://", "https://")):
-        return value
-
+def _allowed_upload_roots():
     roots_value = str(os.environ.get("LEKZA_ALLOWED_UPLOAD_ROOTS") or "").strip()
     roots = [item.strip() for item in roots_value.split(os.pathsep) if item.strip()]
     if not roots:
-        raise ValueError("LEKZA_ALLOWED_UPLOAD_ROOTS is required for remote media")
-    root = Path(roots[0]).expanduser()
-    if not root.is_absolute():
+        raise ValueError("LEKZA_ALLOWED_UPLOAD_ROOTS is required for Telegram media")
+    configured_roots = [Path(item).expanduser() for item in roots]
+    if any(not root.is_absolute() for root in configured_roots):
         raise ValueError("LEKZA_ALLOWED_UPLOAD_ROOTS must contain absolute paths")
-    root.mkdir(parents=True, exist_ok=True)
-    root = root.resolve(strict=True)
+    if any(root.is_symlink() for root in configured_roots):
+        raise ValueError("LEKZA_ALLOWED_UPLOAD_ROOTS must not contain symlinks")
+    configured_roots[0].mkdir(parents=True, exist_ok=True)
+    return [
+        root.resolve(strict=index == 0)
+        for index, root in enumerate(configured_roots)
+    ]
 
-    response = requests.get(value, timeout=30)
-    if response.status_code != 200:
-        raise RuntimeError(
-            f"Failed to download Telegram media: status {response.status_code}"
-        )
-    content = response.content
-    max_bytes = int(os.environ.get("LEKZA_MAX_SLIP_BYTES", 10 * 1024 * 1024))
-    if not content or len(content) > max_bytes:
-        raise ValueError("Downloaded Telegram media size is not allowed")
+
+def _image_suffix(content, source_suffix=None):
     if content.startswith(b"\xff\xd8\xff"):
+        detected_type = "image/jpeg"
         suffix = ".jpg"
     elif content.startswith(b"\x89PNG\r\n\x1a\n"):
+        detected_type = "image/png"
         suffix = ".png"
     elif len(content) >= 12 and content[:4] == b"RIFF" and content[8:12] == b"WEBP":
+        detected_type = "image/webp"
         suffix = ".webp"
     else:
-        raise ValueError("Downloaded Telegram media type is not allowed")
+        raise ValueError("Telegram media type is not allowed")
+    allowed_suffixes = {
+        "image/jpeg": {".jpg", ".jpeg"},
+        "image/png": {".png"},
+        "image/webp": {".webp"},
+    }
+    if (
+        source_suffix is not None
+        and source_suffix.lower() not in allowed_suffixes[detected_type]
+    ):
+        raise ValueError("Telegram media extension does not match its type")
+    return suffix
+
+
+def _validate_media_content(content, source_suffix=None):
+    max_bytes = int(os.environ.get("LEKZA_MAX_SLIP_BYTES", 10 * 1024 * 1024))
+    if max_bytes <= 0:
+        raise ValueError("LEKZA_MAX_SLIP_BYTES must be positive")
+    if not content or len(content) > max_bytes:
+        raise ValueError("Telegram media size is not allowed")
+    return _image_suffix(content, source_suffix)
+
+
+def _local_media_path(value):
+    if value.startswith("file://"):
+        value = urllib.parse.unquote(value[7:])
+    candidate = Path(value).expanduser()
+    if not candidate.is_absolute():
+        raise ValueError("Local Telegram media path must be absolute")
+    if ".." in candidate.parts:
+        raise ValueError("Local Telegram media path traversal is not allowed")
+    current = Path(candidate.anchor)
+    for part in candidate.parts[1:]:
+        current = current / part
+        if current.is_symlink():
+            raise ValueError("Local Telegram media path must not contain symlinks")
+    try:
+        resolved = candidate.resolve(strict=True)
+    except OSError as exc:
+        raise ValueError("Local Telegram media file is not available") from exc
+    if not resolved.is_file():
+        raise ValueError("Local Telegram media must be a regular file")
+    return resolved
+
+
+def _materialize_media(image_path_or_url):
+    """Return validated Telegram media beneath an approved runtime root."""
+    value = str(image_path_or_url)
+    roots = _allowed_upload_roots()
+
+    if not value.startswith(("http://", "https://")):
+        source = _local_media_path(value)
+        max_bytes = int(os.environ.get("LEKZA_MAX_SLIP_BYTES", 10 * 1024 * 1024))
+        with source.open("rb") as stream:
+            content = stream.read(max_bytes + 1)
+        suffix = _validate_media_content(content, source.suffix)
+        if any(source == root or root in source.parents for root in roots):
+            return str(source)
+        root = roots[0]
+    else:
+        root = roots[0]
+
+        response = requests.get(value, timeout=30)
+        if response.status_code != 200:
+            raise RuntimeError(
+                f"Failed to download Telegram media: status {response.status_code}"
+            )
+        content = response.content
+        suffix = _validate_media_content(content)
 
     fd, local_path = tempfile.mkstemp(
         prefix="telegram-slip-", suffix=suffix, dir=str(root)
@@ -254,8 +316,17 @@ def register(ctx):
             with open(log_file, "a", encoding="utf-8") as f:
                 f.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
 
-            downloaded_media = str(chosen_media).startswith(("http://", "https://"))
+            media_is_remote = str(chosen_media).startswith(("http://", "https://"))
+            downloaded_media = media_is_remote
             target_path = _materialize_media(chosen_media)
+            if not media_is_remote:
+                source_value = str(chosen_media)
+                if source_value.startswith("file://"):
+                    source_value = urllib.parse.unquote(source_value[7:])
+                downloaded_media = (
+                    Path(target_path).resolve()
+                    != Path(source_value).expanduser().resolve()
+                )
 
             ocr_res = call_akson_ocr(target_path)
             

@@ -140,6 +140,135 @@ class AccountingSlipBridgeTests(unittest.TestCase):
             finally:
                 local_path.unlink(missing_ok=True)
 
+    def test_local_media_outside_root_is_materialized_beneath_upload_root(self):
+        image = b"\xff\xd8\xff\xe0synthetic-jpeg"
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            upload_root = base / "uploads"
+            source = base / "hermes-cache" / "slip.jpg"
+            source.parent.mkdir()
+            source.write_bytes(image)
+            with patch.dict(
+                os.environ,
+                {"LEKZA_ALLOWED_UPLOAD_ROOTS": str(upload_root)},
+                clear=True,
+            ):
+                materialized = Path(self.module._materialize_media(source))
+
+            self.assertEqual(materialized.parent, upload_root.resolve())
+            self.assertNotEqual(materialized, source)
+            self.assertEqual(materialized.read_bytes(), image)
+
+    def test_local_media_inside_root_is_reused_without_copy(self):
+        with tempfile.TemporaryDirectory() as temp:
+            upload_root = Path(temp) / "uploads"
+            upload_root.mkdir()
+            source = upload_root / "slip.png"
+            source.write_bytes(b"\x89PNG\r\n\x1a\nsynthetic-png")
+            with patch.dict(
+                os.environ,
+                {"LEKZA_ALLOWED_UPLOAD_ROOTS": str(upload_root)},
+                clear=True,
+            ), patch.object(self.module.tempfile, "mkstemp") as mkstemp:
+                materialized = self.module._materialize_media(source)
+
+            self.assertEqual(Path(materialized), source.resolve())
+            mkstemp.assert_not_called()
+
+    def test_local_media_traversal_is_rejected(self):
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            upload_root = base / "uploads"
+            source = base / "slip.jpg"
+            source.write_bytes(b"\xff\xd8\xff\xe0synthetic-jpeg")
+            traversal = upload_root / ".." / "slip.jpg"
+            with patch.dict(
+                os.environ,
+                {"LEKZA_ALLOWED_UPLOAD_ROOTS": str(upload_root)},
+                clear=True,
+            ), self.assertRaisesRegex(ValueError, "traversal"):
+                self.module._materialize_media(traversal)
+
+    def test_local_media_symlink_is_rejected(self):
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            upload_root = base / "uploads"
+            target = base / "target.jpg"
+            target.write_bytes(b"\xff\xd8\xff\xe0synthetic-jpeg")
+            link = base / "link.jpg"
+            os.symlink(target, link)
+            with patch.dict(
+                os.environ,
+                {"LEKZA_ALLOWED_UPLOAD_ROOTS": str(upload_root)},
+                clear=True,
+            ), self.assertRaisesRegex(ValueError, "symlink"):
+                self.module._materialize_media(link)
+
+    def test_local_media_oversize_and_unsupported_type_are_rejected(self):
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            upload_root = base / "uploads"
+            oversized = base / "oversized.jpg"
+            oversized.write_bytes(b"\xff\xd8\xff" + b"x" * 32)
+            unsupported = base / "unsupported.jpg"
+            unsupported.write_bytes(b"text")
+            environment = {
+                "LEKZA_ALLOWED_UPLOAD_ROOTS": str(upload_root),
+                "LEKZA_MAX_SLIP_BYTES": "16",
+            }
+            with patch.dict(os.environ, environment, clear=True):
+                with self.assertRaisesRegex(ValueError, "size"):
+                    self.module._materialize_media(oversized)
+                with self.assertRaisesRegex(ValueError, "type"):
+                    self.module._materialize_media(unsupported)
+
+    def test_local_media_outside_root_handoff_uses_materialized_path(self):
+        with tempfile.TemporaryDirectory() as temp:
+            staging_root = Path(temp) / "staging"
+            environment = self._staging_environment(staging_root)
+            source = Path(temp) / "hermes-cache" / "slip.jpg"
+            source.parent.mkdir()
+            source.write_bytes(b"\xff\xd8\xff\xe0synthetic-jpeg")
+            event = types.SimpleNamespace(
+                source=types.SimpleNamespace(
+                    platform="telegram", chat_id="1001", user_id="2001"
+                ),
+                media_urls=[str(source)],
+                media_types=["image/jpeg"],
+                message_id="synthetic-message",
+            )
+            handed_off = []
+            buttons = types.SimpleNamespace(
+                handoff_ocr_result=lambda *args, **kwargs: handed_off.append(
+                    kwargs["source_image_path"]
+                ) or {"transaction": {"transaction_id": "synthetic-id"}}
+            )
+            gateway = types.SimpleNamespace(adapters={
+                "telegram": types.SimpleNamespace(
+                    _bot=types.SimpleNamespace(id="3001")
+                )
+            })
+            with patch.dict(os.environ, environment, clear=True), patch.dict(
+                "sys.modules", {"lekza_accounting_transaction_buttons": buttons}
+            ), patch.object(
+                self.module,
+                "call_akson_ocr",
+                return_value={
+                    "akson_called": True,
+                    "parsed": {"reference_no": "SYNTHETIC"},
+                },
+            ), patch.object(self.module.os, "makedirs"), patch(
+                "builtins.open", mock_open()
+            ):
+                result = self._image_hook()(event, gateway=gateway)
+
+            materialized = Path(handed_off[0])
+            self.assertEqual(result["action"], "rewrite")
+            self.assertEqual(
+                materialized.parent, (staging_root / "uploads").resolve()
+            )
+            self.assertEqual(materialized.read_bytes(), source.read_bytes())
+
     def test_remote_media_handoff_receives_materialized_local_path(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp) / "staging"
