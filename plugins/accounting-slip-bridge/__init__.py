@@ -1,6 +1,7 @@
 import os
 import sys
 import json
+import re
 import requests
 import urllib.parse
 import importlib.util
@@ -9,6 +10,38 @@ from pathlib import Path
 
 
 _STAGING_GUARD = None
+_MAX_DIAGNOSTIC_MESSAGE_LENGTH = 160
+_URL_PATTERN = re.compile(r"(?i)\b(?:https?|file)://[^\s,;]+")
+_RAW_OCR_PATTERN = re.compile(r"(?is)\braw[ _-]?ocr(?:[ _-]?text)?\s*[:=].*$")
+_SENSITIVE_VALUE_PATTERN = re.compile(
+    r"(?i)\b("
+    r"token|secret|credential|authorization|api[ _-]?key|"
+    r"google(?:[ _-]?(?:resource|drive|sheet|spreadsheet|folder))?[ _-]?id|"
+    r"telegram[ _-]?id|chat[ _-]?id|user[ _-]?id|bot[ _-]?id|"
+    r"drive[ _-]?id|spreadsheet[ _-]?id|folder[ _-]?id"
+    r")\b\s*[:=]\s*(?:\"[^\"]*\"|'[^']*'|[^\s,;]+)"
+)
+_ABSOLUTE_PATH_PATTERN = re.compile(
+    r"(?i)(?:\b[A-Z]:[\\/]|(?<![:/])/(?:data|tmp|var|home)/)[^\s,;]+"
+)
+_OPAQUE_ID_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9_-])[A-Za-z0-9_-]{16,}(?![A-Za-z0-9_-])"
+)
+_NUMERIC_ID_PATTERN = re.compile(r"(?<!\d)\d{5,}(?!\d)")
+
+
+def _sanitized_error_message(exc):
+    message = " ".join(str(exc).split())
+    message = _RAW_OCR_PATTERN.sub("raw_ocr_text=<redacted>", message)
+    message = _URL_PATTERN.sub("<redacted-url>", message)
+    message = _SENSITIVE_VALUE_PATTERN.sub(r"\1=<redacted>", message)
+    message = _ABSOLUTE_PATH_PATTERN.sub("<redacted-path>", message)
+    message = _OPAQUE_ID_PATTERN.sub("<redacted-id>", message)
+    message = _NUMERIC_ID_PATTERN.sub("<redacted-id>", message)
+    message = message.strip()
+    if not message:
+        message = "<redacted>"
+    return message[:_MAX_DIAGNOSTIC_MESSAGE_LENGTH]
 
 
 def _staging_guard():
@@ -375,6 +408,7 @@ def register(ctx):
                         f.write(json.dumps({
                             "telegram_transaction_handoff_failed": True,
                             "error_type": handoff_error,
+                            "error_message": _sanitized_error_message(exc),
                         }, ensure_ascii=False) + "\n")
                     if downloaded_media and not durable_handoff:
                         try:

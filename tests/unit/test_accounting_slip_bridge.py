@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import os
 from pathlib import Path
 import tempfile
@@ -310,6 +311,76 @@ class AccountingSlipBridgeTests(unittest.TestCase):
 
         self.assertEqual(result["action"], "rewrite")
         self.assertEqual(handed_off, [str(local_path)])
+
+    def test_handoff_failure_log_has_sanitized_truncated_error_message(self):
+        secret_token = "synthetic-secret-token-value"
+        file_url = "file:///synthetic/private/slip.jpg"
+        google_id = "syntheticGoogleResourceId123456789"
+        telegram_id = "987654321"
+        raw_ocr = "synthetic raw OCR customer text"
+        exception_message = (
+            "handoff rejected: "
+            f"token={secret_token} file={file_url} google_id={google_id} "
+            f"telegram_id={telegram_id} raw_ocr_text={raw_ocr} "
+            + "x" * 240
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "staging"
+            environment = self._staging_environment(root)
+            local_path = root / "uploads" / "telegram-slip.jpg"
+            event = types.SimpleNamespace(
+                source=types.SimpleNamespace(
+                    platform="telegram", chat_id="1001", user_id="2001"
+                ),
+                media_urls=["https://example.invalid/slip.jpg"],
+                media_types=["image/jpeg"],
+                message_id="synthetic-message",
+            )
+            buttons = types.SimpleNamespace(
+                handoff_ocr_result=lambda *args, **kwargs: (_ for _ in ()).throw(
+                    ValueError(exception_message)
+                )
+            )
+            gateway = types.SimpleNamespace(adapters={
+                "telegram": types.SimpleNamespace(
+                    _bot=types.SimpleNamespace(id="3001")
+                )
+            })
+            opened = mock_open()
+            with patch.dict(os.environ, environment, clear=True), patch.dict(
+                "sys.modules", {"lekza_accounting_transaction_buttons": buttons}
+            ), patch.object(
+                self.module, "_materialize_media", return_value=str(local_path)
+            ), patch.object(
+                self.module,
+                "call_akson_ocr",
+                return_value={"akson_called": True, "parsed": {}},
+            ), patch.object(self.module.os, "makedirs"), patch(
+                "builtins.open", opened
+            ):
+                self._image_hook()(event, gateway=gateway)
+
+        entries = [
+            json.loads(call.args[0])
+            for call in opened().write.call_args_list
+            if "telegram_transaction_handoff_failed" in call.args[0]
+        ]
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["error_type"], "ValueError")
+        self.assertLessEqual(len(entries[0]["error_message"]), 160)
+        self.assertIn("handoff rejected", entries[0]["error_message"])
+        truncated = self.module._sanitized_error_message(
+            ValueError("diagnostic " + "word " * 100)
+        )
+        self.assertEqual(len(truncated), 160)
+        for sensitive_value in (
+            secret_token,
+            file_url,
+            google_id,
+            telegram_id,
+            raw_ocr,
+        ):
+            self.assertNotIn(sensitive_value, entries[0]["error_message"])
 
     def test_remote_download_exception_is_redacted_and_fails_closed(self):
         secret_url = "https://example.invalid/slip.jpg?token=secret-value"
