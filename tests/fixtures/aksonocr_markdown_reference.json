@@ -1,0 +1,16 @@
+{
+  "reference_no": "PHASED-SMOKE-20260901-01",
+  "markdown_samples": [
+    "**หมายเลขอ้างอิง:** PHASED-SMOKE-20260901-01",
+    "หมายเลขอ้างอิง: **PHASED-SMOKE-20260901-01**",
+    "**Reference No:** PHASED-SMOKE-20260901-01",
+    "Reference **No:** **PHASED-SMOKE-20260901-01**",
+    "*Reference Number:* *PHASED-SMOKE-20260901-01*",
+    "__Reference No:__ __PHASED-SMOKE-20260901-01__",
+    "**หมายเลขอ้างอิง:**\n\n  **PHASED-SMOKE-20260901-01**"
+  ],
+  "unlabeled_samples": [
+    "ยอดเงิน: 20260901.01\nPHASED-SMOKE-20260901-01",
+    "วันที่ทำรายการ: 2026-09-01\nจำนวนเงิน: 1.00"
+  ]
+}

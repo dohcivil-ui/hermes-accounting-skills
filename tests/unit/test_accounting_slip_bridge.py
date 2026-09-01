@@ -11,6 +11,9 @@ from unittest.mock import mock_open, patch
 
 ROOT = Path(__file__).resolve().parents[2]
 MODULE_PATH = ROOT / "plugins/accounting-slip-bridge/__init__.py"
+MARKDOWN_REFERENCE_FIXTURE = (
+    ROOT / "tests/fixtures/aksonocr_markdown_reference.json"
+)
 
 
 def load_module():
@@ -353,6 +356,28 @@ class AccountingSlipBridgeTests(unittest.TestCase):
                     ocr_result
                 )
                 self.assertEqual(normalized["parsed"]["reference_no"], expected)
+
+    def test_ocr_normalization_handles_aksonocr_markdown_reference_fixture(self):
+        fixture = json.loads(
+            MARKDOWN_REFERENCE_FIXTURE.read_text(encoding="utf-8")
+        )
+        expected = fixture["reference_no"]
+        for markdown in fixture["markdown_samples"]:
+            with self.subTest(markdown=markdown):
+                normalized = self.module._normalize_ocr_result_for_handoff({
+                    "parsed": {"amount": 1},
+                    "raw_ocr_text": markdown,
+                })
+                self.assertEqual(normalized["parsed"]["reference_no"], expected)
+
+        for markdown in fixture["unlabeled_samples"]:
+            with self.subTest(unlabeled=markdown), self.assertRaisesRegex(
+                ValueError, "requires reference_no after normalization"
+            ):
+                self.module._normalize_ocr_result_for_handoff({
+                    "parsed": {"amount": 1},
+                    "raw_ocr_text": markdown,
+                })
 
     def test_ocr_normalization_without_reference_fails_closed(self):
         with self.assertRaisesRegex(

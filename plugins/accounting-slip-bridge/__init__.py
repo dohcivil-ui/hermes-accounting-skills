@@ -39,9 +39,16 @@ _REFERENCE_FALLBACK_KEYS = {
     "bankreference",
     "slipreference",
 }
+_MARKDOWN_EMPHASIS_OPEN_PATTERN = re.compile(
+    r"(?<!\w)(?:\*{1,3}|_{1,3})(?=\S)"
+)
+_MARKDOWN_EMPHASIS_CLOSE_PATTERN = re.compile(
+    r"(?<=\S)(?:\*{1,3}|_{1,3})(?!\w)"
+)
 _REFERENCE_TEXT_PATTERNS = (
     re.compile(
-        r"(?im)\b(?:reference|ref)(?:\s*(?:no|number))?\s*[:#-]?\s*"
+        r"(?im)\b(?:reference|ref(?!erence))(?:\s*(?:no|number))?"
+        r"\s*[:#-]?\s*"
         r"([A-Za-z0-9][A-Za-z0-9._/-]{2,127})"
     ),
     re.compile(
@@ -100,8 +107,15 @@ def _reference_from_text(ocr_result):
     for text in texts:
         if not isinstance(text, str):
             continue
+        normalized_text = unicodedata.normalize("NFKC", text)
+        normalized_text = _MARKDOWN_EMPHASIS_OPEN_PATTERN.sub(
+            "", normalized_text
+        )
+        normalized_text = _MARKDOWN_EMPHASIS_CLOSE_PATTERN.sub(
+            "", normalized_text
+        )
         for pattern in _REFERENCE_TEXT_PATTERNS:
-            match = pattern.search(text)
+            match = pattern.search(normalized_text)
             if match:
                 reference = _structured_reference(match.group(1))
                 if reference:
