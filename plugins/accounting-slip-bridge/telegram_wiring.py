@@ -261,7 +261,9 @@ class TelegramTransactionController:
                 ),
             })
 
-        if state == "waiting_project":
+        if record.get("needs_reference"):
+            button("❌ ยกเลิก", "cancel")
+        elif state == "waiting_project":
             if record.get("entry_mode") in {"new_project", "manual_entry"}:
                 button("⬅️ กลับ", "back")
                 button("❌ ยกเลิก", "cancel")
@@ -408,6 +410,8 @@ class TelegramTransactionController:
     @staticmethod
     def _prompt_text(record):
         state = record["current_state"]
+        if record.get("needs_reference"):
+            return "พิมพ์หมายเลขอ้างอิงจากสลิปก่อนดำเนินการต่อ"
         if state == "waiting_project" and record.get("entry_mode") == "new_project":
             return "พิมพ์ชื่อโครงการใหม่"
         if state == "waiting_project" and record.get("entry_mode") == "manual_entry":

@@ -39,6 +39,10 @@ ACTIVE_STATES = {
 }
 ALL_STATES = ACTIVE_STATES | {"confirmed", "cancelled"}
 MUTABLE_STATE_COLUMNS = {
+    "reference_no",
+    "reference_no_normalized",
+    "ocr_fields_json",
+    "needs_reference",
     "project",
     "transaction_type",
     "category",
@@ -177,6 +181,7 @@ class SQLiteStateStore:
                 telegram_user_id TEXT NOT NULL,
                 reference_no TEXT NOT NULL,
                 reference_no_normalized TEXT NOT NULL,
+                needs_reference INTEGER NOT NULL DEFAULT 0,
                 source_image_path TEXT NOT NULL,
                 ocr_fields_json TEXT NOT NULL,
                 confidence REAL,
@@ -212,9 +217,6 @@ class SQLiteStateStore:
                     'confirmed', 'cancelled', 'failed'
                 ))
             );
-            CREATE UNIQUE INDEX IF NOT EXISTS uq_active_reference
-            ON transaction_state(tenant_id, reference_no_normalized)
-            WHERE current_state <> 'cancelled';
             CREATE INDEX IF NOT EXISTS idx_transaction_actor
             ON transaction_state(platform, chat_id, telegram_user_id);
             CREATE INDEX IF NOT EXISTS idx_transaction_state
@@ -236,6 +238,7 @@ class SQLiteStateStore:
             "initial_prompt_attempt_count": "INTEGER NOT NULL DEFAULT 0",
             "initial_prompt_message_id": "TEXT",
             "handoff_key": "TEXT",
+            "needs_reference": "INTEGER NOT NULL DEFAULT 0",
         }
         for column, definition in migrations.items():
             if column in columns:
@@ -245,6 +248,14 @@ class SQLiteStateStore:
                     f"ALTER TABLE transaction_state ADD COLUMN {column} {definition}"
                 )
         with self._connection:
+            self._connection.execute("DROP INDEX IF EXISTS uq_active_reference")
+            self._connection.execute(
+                """
+                CREATE UNIQUE INDEX uq_active_reference
+                ON transaction_state(tenant_id, reference_no_normalized)
+                WHERE current_state <> 'cancelled' AND needs_reference = 0
+                """
+            )
             self._connection.execute(
                 """
                 UPDATE transaction_state
@@ -291,12 +302,15 @@ class SQLiteStateStore:
         return self._decode(row) if row is not None else None
 
     def get_by_reference(self, tenant_id, reference_no):
+        reference_key = _normalize_reference(reference_no)
+        if not reference_key:
+            return None
         row = self._connection.execute(
             """
             SELECT * FROM transaction_state
             WHERE tenant_id = ? AND reference_no_normalized = ?
             """,
-            (str(tenant_id), _normalize_reference(reference_no)),
+            (str(tenant_id), reference_key),
         ).fetchone()
         return self._decode(row) if row is not None else None
 
@@ -675,6 +689,7 @@ class SQLiteStateStore:
         record["ocr_fields"] = json.loads(record.pop("ocr_fields_json"))
         record["history"] = json.loads(record.pop("history_json"))
         record["new_project"] = bool(record["new_project"])
+        record["needs_reference"] = bool(record["needs_reference"])
         return record
 
     def close(self):
@@ -736,15 +751,18 @@ class TransactionFlow:
         parsed = dict(ocr_result.get("parsed") or {})
         reference_no = str(parsed.get("reference_no") or "").strip()
         reference_key = _normalize_reference(reference_no)
-        if not reference_key:
-            raise ValueError("OCR result requires reference_no")
+        needs_reference = not reference_key
+        if not needs_reference:
+            reference_no = self._validated_reference(reference_no)
+            reference_key = _normalize_reference(reference_no)
 
         minimal_fields = {
             field: parsed[field]
             for field in OCR_FIELDS
             if field in parsed and parsed[field] is not None
         }
-        minimal_fields["reference_no"] = reference_no
+        if not needs_reference:
+            minimal_fields["reference_no"] = reference_no
         if "amount" in minimal_fields:
             minimal_fields["amount"] = _as_number(minimal_fields["amount"])
         now = _utc_now()
@@ -761,11 +779,13 @@ class TransactionFlow:
                 "telegram_user_id": str(telegram_user_id),
                 "reference_no": reference_no,
                 "reference_no_normalized": reference_key,
+                "needs_reference": 1 if needs_reference else 0,
                 "source_image_path": str(source_path),
                 "ocr_fields_json": json.dumps(
                     minimal_fields, ensure_ascii=False, separators=(",", ":")
                 ),
                 "confidence": ocr_result.get("confidence"),
+                "entry_mode": "reference" if needs_reference else None,
                 "current_state": "waiting_project",
                 "created_at": now,
                 "updated_at": now,
@@ -1035,6 +1055,37 @@ class TransactionFlow:
         manual_value = str(value or "").strip()
         if not manual_value:
             raise ValueError("Manual value is required")
+        if record["needs_reference"] and record["entry_mode"] == "reference":
+            reference_no = self._validated_reference(manual_value)
+            ocr_fields = dict(record["ocr_fields"])
+            ocr_fields["reference_no"] = reference_no
+            try:
+                updated = self._store.transition(
+                    transaction_id,
+                    platform=platform,
+                    chat_id=chat_id,
+                    telegram_user_id=telegram_user_id,
+                    expected_version=expected_version,
+                    allowed_from={"waiting_project"},
+                    changes={
+                        "reference_no": reference_no,
+                        "reference_no_normalized": _normalize_reference(
+                            reference_no
+                        ),
+                        "ocr_fields_json": json.dumps(
+                            ocr_fields,
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        ),
+                        "needs_reference": 0,
+                        "entry_mode": None,
+                    },
+                )
+            except sqlite3.IntegrityError as exc:
+                raise DuplicateReferenceError(
+                    "Reference number already exists for this tenant"
+                ) from exc
+            return self._view(updated)
         if record["current_state"] == "waiting_project" and record[
             "entry_mode"
         ] in {"new_project", "manual_entry"}:
@@ -1085,6 +1136,7 @@ class TransactionFlow:
             return self._view(record)
         if record["current_state"] != "waiting_review":
             raise InvalidTransitionError("Transaction is not ready for confirmation")
+        self._require_valid_reference(record)
         try:
             updated = self._store.transition(
                 transaction_id,
@@ -1113,6 +1165,11 @@ class TransactionFlow:
         chat_id,
         telegram_user_id,
     ):
+        record = self._require_authorized(
+            transaction_id, platform, chat_id, telegram_user_id
+        )
+        self._require_current_version(record, expected_version)
+        self._require_valid_reference(record)
         return self._transition_state(
             transaction_id,
             expected_version=expected_version,
@@ -1467,6 +1524,32 @@ class TransactionFlow:
     def _require_current_version(record, expected_version):
         if record["version"] != int(expected_version):
             raise StaleStateError("Transaction callback is stale")
+
+    @staticmethod
+    def _validated_reference(value):
+        reference = unicodedata.normalize("NFKC", str(value or "")).strip()
+        if not 3 <= len(reference) <= 128:
+            raise ValueError("Reference number must be 3 to 128 characters")
+        if any(
+            not (character.isalnum() or character in "-._/")
+            for character in reference
+        ):
+            raise ValueError("Reference number contains unsupported characters")
+        return reference
+
+    @staticmethod
+    def _require_valid_reference(record):
+        reference_no = str(record.get("reference_no") or "").strip()
+        if record.get("needs_reference") or not _normalize_reference(reference_no):
+            raise InvalidTransitionError(
+                "Transaction requires reference number before confirmation"
+            )
+        try:
+            TransactionFlow._validated_reference(reference_no)
+        except ValueError as exc:
+            raise InvalidTransitionError(
+                "Transaction reference number is invalid"
+            ) from exc
 
     def _validate_source_path(self, source_image_path):
         candidate = Path(source_image_path).expanduser()

@@ -371,22 +371,20 @@ class AccountingSlipBridgeTests(unittest.TestCase):
                 self.assertEqual(normalized["parsed"]["reference_no"], expected)
 
         for markdown in fixture["unlabeled_samples"]:
-            with self.subTest(unlabeled=markdown), self.assertRaisesRegex(
-                ValueError, "requires reference_no after normalization"
-            ):
-                self.module._normalize_ocr_result_for_handoff({
+            with self.subTest(unlabeled=markdown):
+                normalized = self.module._normalize_ocr_result_for_handoff({
                     "parsed": {"amount": 1},
                     "raw_ocr_text": markdown,
                 })
+                self.assertNotIn("reference_no", normalized["parsed"])
 
-    def test_ocr_normalization_without_reference_fails_closed(self):
-        with self.assertRaisesRegex(
-            ValueError, "OCR result requires reference_no after normalization"
-        ):
-            self.module._normalize_ocr_result_for_handoff({
-                "parsed": {"amount": 1},
-                "raw_ocr_text": "Amount: 1.00",
-            })
+    def test_ocr_normalization_without_reference_does_not_fabricate_one(self):
+        normalized = self.module._normalize_ocr_result_for_handoff({
+            "parsed": {"amount": 1},
+            "raw_ocr_text": "Amount: 1.00",
+        })
+
+        self.assertNotIn("reference_no", normalized["parsed"])
 
     def test_text_reference_is_normalized_before_durable_handoff(self):
         with tempfile.TemporaryDirectory() as temp:

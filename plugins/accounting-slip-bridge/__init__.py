@@ -147,10 +147,8 @@ def _normalize_ocr_result_for_handoff(ocr_result):
                 break
     if reference is None:
         reference = _reference_from_text(ocr_result)
-    if reference is None:
-        raise ValueError("OCR result requires reference_no after normalization")
-
-    parsed["reference_no"] = reference
+    if reference is not None:
+        parsed["reference_no"] = reference
     normalized["parsed"] = parsed
     return normalized
 

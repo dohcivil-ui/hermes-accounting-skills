@@ -53,6 +53,8 @@ The deterministic SQLite integration harness covers:
 - failure/retry state and retry count persistence;
 - allowed-root, traversal, symlink, image type, extension, and size checks;
 - minimal OCR-field retention and numeric amount normalization.
+- missing OCR reference handoff, authorized manual reference entry, restart
+  recovery, duplicate-reference rejection, and fail-closed confirmation.
 
 The Drive and Sheets steps in these tests are durable state checkpoints only.
 Production adapters and real Telegram callback wiring remain outside Phase A.

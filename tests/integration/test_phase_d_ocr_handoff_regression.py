@@ -17,6 +17,9 @@ FIXTURE_PATH = ROOT / "tests/fixtures/phase_d_aksonocr_handoff.json"
 REAL_SHAPE_FIXTURE_PATH = (
     ROOT / "tests/fixtures/aksonocr_real_response_shape.json"
 )
+MISSING_REFERENCE_FIXTURE_PATH = (
+    ROOT / "tests/fixtures/aksonocr_real_missing_reference_shape.json"
+)
 REFERENCE_NO = "PHASED-SMOKE-20260901-01"
 
 
@@ -64,6 +67,146 @@ class PhaseDOcrHandoffRegressionTests(unittest.TestCase):
         return json.loads(
             REAL_SHAPE_FIXTURE_PATH.read_text(encoding="utf-8")
         )
+
+    def missing_reference_fixture(self):
+        return json.loads(
+            MISSING_REFERENCE_FIXTURE_PATH.read_text(encoding="utf-8")
+        )
+
+    def test_missing_reference_is_supplied_before_confirm_ready(self):
+        api_response = self.missing_reference_fixture()
+        ocr_result = {
+            "akson_called": True,
+            "http_status": 201,
+            "confidence": api_response["confidence"],
+            "raw_ocr_text": api_response["pages"][0]["markdown"],
+            "parsed": api_response["parsed"],
+            "usage": api_response["usage"],
+            "raw_response": api_response,
+        }
+        normalized = self.bridge._normalize_ocr_result_for_handoff(ocr_result)
+        created = self.controller.begin_from_ocr(
+            tenant_id="phase-d-missing-reference-tenant",
+            chat_id="phase-d-synthetic-chat",
+            thread_id=None,
+            session_id="phase-d-missing-reference-session",
+            handoff_id="phase-d-missing-reference-message",
+            telegram_user_id="phase-d-synthetic-user",
+            source_image_path=self.slip,
+            ocr_result=normalized,
+        )
+        actor = {
+            "platform": "telegram",
+            "chat_id": "phase-d-synthetic-chat",
+            "telegram_user_id": "phase-d-synthetic-user",
+        }
+        prompt = self.controller.render(created["transaction_id"], **actor)
+        self.assertTrue(prompt["manual_input_required"])
+        self.assertIn("อ้างอิง", prompt["text"])
+
+        replayed = self.controller.begin_from_ocr(
+            tenant_id="phase-d-missing-reference-tenant",
+            chat_id="phase-d-synthetic-chat",
+            thread_id=None,
+            session_id="phase-d-missing-reference-session",
+            handoff_id="phase-d-missing-reference-message",
+            telegram_user_id="phase-d-synthetic-user",
+            source_image_path=self.slip,
+            ocr_result=normalized,
+        )
+        self.assertEqual(replayed["transaction_id"], created["transaction_id"])
+
+        forged_confirm = self.wiring.encode_callback(
+            created["transaction_id"], created["version"], "confirm"
+        )
+        rejected = self.controller.handle_callback(forged_confirm, **actor)
+        self.assertFalse(rejected["ok"])
+        self.assertEqual(rejected["error_code"], "invalid_transition")
+        with self.assertRaises(self.flow_module.InvalidTransitionError):
+            self.flow.confirm(
+                created["transaction_id"],
+                expected_version=created["version"],
+                **actor,
+            )
+
+        unauthorized = self.controller.handle_manual_message(
+            REFERENCE_NO,
+            platform="telegram",
+            chat_id="phase-d-synthetic-chat",
+            telegram_user_id="different-user",
+        )
+        self.assertIsNone(unauthorized)
+
+        invalid = self.controller.handle_manual_message(
+            "not a reference!", **actor
+        )
+        self.assertFalse(invalid["ok"])
+        still_missing = self.flow.get_transaction(
+            created["transaction_id"], **actor
+        )
+        self.assertTrue(still_missing["needs_reference"])
+
+        self.store.close()
+        self.store = self.flow_module.SQLiteStateStore(
+            self.root / "state" / "transactions.sqlite3"
+        )
+        self.flow = self.flow_module.TransactionFlow(
+            self.store,
+            allowed_source_roots=[self.uploads],
+            projects=["Synthetic Project"],
+        )
+        self.controller = self.wiring.TelegramTransactionController(
+            self.flow,
+            object(),
+            projects=["Synthetic Project"],
+        )
+        supplied = self.controller.handle_manual_message(
+            REFERENCE_NO, **actor
+        )
+        self.assertTrue(supplied["ok"])
+        prompt = supplied["prompt"]
+        self.assertEqual(prompt["current_state"], "waiting_project")
+
+        second = self.controller.begin_from_ocr(
+            tenant_id="phase-d-missing-reference-tenant",
+            chat_id="phase-d-synthetic-chat",
+            thread_id=None,
+            session_id="phase-d-second-missing-session",
+            handoff_id="phase-d-second-missing-message",
+            telegram_user_id="phase-d-synthetic-user",
+            source_image_path=self.slip,
+            ocr_result=normalized,
+        )
+        duplicate = self.controller.handle_manual_message(REFERENCE_NO, **actor)
+        self.assertFalse(duplicate["ok"])
+        second_durable = self.flow.get_transaction(
+            second["transaction_id"], **actor
+        )
+        self.assertTrue(second_durable["needs_reference"])
+
+        for action in ("select_project", "use_sender", "expense", "materials"):
+            button = next(
+                item
+                for item in prompt["buttons"]
+                if self.wiring.decode_callback(item["callback_data"]).action
+                == action
+            )
+            result = self.controller.handle_callback(
+                button["callback_data"], **actor
+            )
+            self.assertTrue(result["ok"])
+            prompt = result["prompt"]
+
+        self.assertEqual(prompt["current_state"], "waiting_review")
+        actions = {
+            self.wiring.decode_callback(item["callback_data"]).action
+            for item in prompt["buttons"]
+        }
+        self.assertIn("confirm", actions)
+        durable = self.store.get_by_reference(
+            "phase-d-missing-reference-tenant", REFERENCE_NO
+        )
+        self.assertEqual(durable["reference_no"], REFERENCE_NO)
 
     def test_real_api_shape_survives_adapter_and_creates_transaction(self):
         api_response = self.real_shape_fixture()
@@ -190,7 +333,7 @@ class PhaseDOcrHandoffRegressionTests(unittest.TestCase):
                     durable["ocr_fields"]["reference_no"], REFERENCE_NO
                 )
 
-    def test_phase_d_unlabeled_ocr_fails_before_durable_transaction(self):
+    def test_phase_d_unlabeled_ocr_does_not_fabricate_reference(self):
         fixture = self.fixture()
         fixture["raw_ocr_text"] = (
             "วันที่ทำรายการ: 2026-09-01\nจำนวนเงิน: 1.00\n"
@@ -198,11 +341,9 @@ class PhaseDOcrHandoffRegressionTests(unittest.TestCase):
         )
         fixture["raw_response"] = {}
 
-        with self.assertRaisesRegex(
-            ValueError, "requires reference_no after normalization"
-        ):
-            self.bridge._normalize_ocr_result_for_handoff(fixture)
+        normalized = self.bridge._normalize_ocr_result_for_handoff(fixture)
 
+        self.assertNotIn("reference_no", normalized["parsed"])
         self.assertIsNone(
             self.store.get_by_reference("phase-d-synthetic-tenant", REFERENCE_NO)
         )

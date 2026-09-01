@@ -75,6 +75,14 @@ active external state -> failed -> retry state
 interactive state -> cancelled
 ```
 
+If AksonOCR returns no labeled bank reference, the handoff still creates the
+transaction using `transaction_id` as its durable identity. The row explicitly
+sets `needs_reference` and Telegram requires authorized manual reference input
+before project selection continues. Missing-reference rows are excluded from
+the active tenant/reference uniqueness index until a validated reference is
+stored atomically. Confirmation and the first external save checkpoint both
+fail closed while `needs_reference` is set or the reference is empty.
+
 Only required parsed OCR fields and confidence are persisted. Raw OCR text,
 provider responses, API credentials, and customer-sensitive diagnostic data are
 not stored by this module. Source images must resolve beneath an approved root,
