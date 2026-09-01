@@ -1,0 +1,29 @@
+{
+  "akson_called": true,
+  "http_status": 201,
+  "confidence": 1.0,
+  "raw_ocr_text": "# Synthetic Transfer Slip\n\n**หมายเลขอ้างอิง:**\n\n  **PHASED-SMOKE-20260901-01**\n\n**จำนวนเงิน:** 1.00",
+  "markdown_variants": [
+    "**หมายเลขอ้างอิง:** PHASED-SMOKE-20260901-01",
+    "หมายเลขอ้างอิง: **PHASED-SMOKE-20260901-01**",
+    "**Reference No:**\n\n  **PHASED-SMOKE-20260901-01**",
+    "Reference **Number:** PHASED-SMOKE-20260901-01"
+  ],
+  "parsed": {
+    "amount": "1.00",
+    "date": "2026-09-01",
+    "payer": "Synthetic Payer",
+    "payee": "Synthetic Payee"
+  },
+  "usage": {
+    "pages": 1
+  },
+  "raw_response": {
+    "confidence": 1.0,
+    "pages": [
+      {
+        "markdown": "# Synthetic Transfer Slip\n\n**หมายเลขอ้างอิง:**\n\n  **PHASED-SMOKE-20260901-01**\n\n**จำนวนเงิน:** 1.00"
+      }
+    ]
+  }
+}
