@@ -6,6 +6,7 @@ import requests
 import urllib.parse
 import importlib.util
 import tempfile
+import unicodedata
 from pathlib import Path
 
 
@@ -28,6 +29,26 @@ _OPAQUE_ID_PATTERN = re.compile(
     r"(?<![A-Za-z0-9_-])[A-Za-z0-9_-]{16,}(?![A-Za-z0-9_-])"
 )
 _NUMERIC_ID_PATTERN = re.compile(r"(?<!\d)\d{5,}(?!\d)")
+_REFERENCE_FALLBACK_KEYS = {
+    "reference",
+    "referenceno",
+    "referencenumber",
+    "refno",
+    "transactionreference",
+    "transactionref",
+    "bankreference",
+    "slipreference",
+}
+_REFERENCE_TEXT_PATTERNS = (
+    re.compile(
+        r"(?im)\b(?:reference|ref)(?:\s*(?:no|number))?\s*[:#-]?\s*"
+        r"([A-Za-z0-9][A-Za-z0-9._/-]{2,127})"
+    ),
+    re.compile(
+        r"(?m)(?:รหัสอ้างอิง|หมายเลขอ้างอิง|เลขที่รายการ)\s*[:：#-]?\s*"
+        r"([A-Za-z0-9][A-Za-z0-9._/-]{2,127})"
+    ),
+)
 
 
 def _sanitized_error_message(exc):
@@ -42,6 +63,82 @@ def _sanitized_error_message(exc):
     if not message:
         message = "<redacted>"
     return message[:_MAX_DIAGNOSTIC_MESSAGE_LENGTH]
+
+
+def _structured_reference(value):
+    if value is None or isinstance(value, (bool, dict, list, tuple, set)):
+        return None
+    reference = unicodedata.normalize("NFKC", str(value)).strip()
+    reference = re.sub(r"\s+", "-", reference)
+    reference = reference.strip("-._/")
+    if not 3 <= len(reference) <= 128:
+        return None
+    if not all(
+        character.isalnum() or character in "-._/" for character in reference
+    ):
+        return None
+    return reference
+
+
+def _reference_from_mapping(mapping):
+    if not isinstance(mapping, dict):
+        return None
+    for key, value in mapping.items():
+        normalized_key = re.sub(r"[^a-z0-9]", "", str(key).lower())
+        if normalized_key in _REFERENCE_FALLBACK_KEYS:
+            reference = _structured_reference(value)
+            if reference:
+                return reference
+    return None
+
+
+def _reference_from_text(ocr_result):
+    texts = [ocr_result.get("raw_ocr_text"), ocr_result.get("text")]
+    raw_response = ocr_result.get("raw_response")
+    if isinstance(raw_response, dict):
+        texts.extend((raw_response.get("text"), raw_response.get("raw_ocr_text")))
+    for text in texts:
+        if not isinstance(text, str):
+            continue
+        for pattern in _REFERENCE_TEXT_PATTERNS:
+            match = pattern.search(text)
+            if match:
+                reference = _structured_reference(match.group(1))
+                if reference:
+                    return reference
+    return None
+
+
+def _normalize_ocr_result_for_handoff(ocr_result):
+    if not isinstance(ocr_result, dict):
+        raise ValueError("OCR result must be a mapping")
+    normalized = dict(ocr_result)
+    parsed_value = ocr_result.get("parsed")
+    parsed = dict(parsed_value) if isinstance(parsed_value, dict) else {}
+
+    reference = _structured_reference(parsed.get("reference_no"))
+    if reference is None:
+        reference = _reference_from_mapping(parsed)
+    if reference is None:
+        reference = _reference_from_mapping(ocr_result)
+    raw_response = ocr_result.get("raw_response")
+    if reference is None and isinstance(raw_response, dict):
+        for candidate in (
+            raw_response.get("parsed"),
+            raw_response.get("data"),
+            raw_response,
+        ):
+            reference = _reference_from_mapping(candidate)
+            if reference:
+                break
+    if reference is None:
+        reference = _reference_from_text(ocr_result)
+    if reference is None:
+        raise ValueError("OCR result requires reference_no after normalization")
+
+    parsed["reference_no"] = reference
+    normalized["parsed"] = parsed
+    return normalized
 
 
 def _staging_guard():
@@ -387,12 +484,14 @@ def register(ctx):
                 try:
                     import lekza_accounting_transaction_buttons as telegram_buttons
 
+                    normalized_ocr_res = _normalize_ocr_result_for_handoff(ocr_res)
+                    parsed_fields = normalized_ocr_res["parsed"]
                     handoff = telegram_buttons.handoff_ocr_result(
                         event,
                         gateway,
                         session_store,
                         source_image_path=target_path,
-                        ocr_result=ocr_res,
+                        ocr_result=normalized_ocr_res,
                     )
                     transaction_id = handoff["transaction"]["transaction_id"]
                     durable_handoff = True

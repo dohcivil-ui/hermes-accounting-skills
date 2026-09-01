@@ -312,6 +312,107 @@ class AccountingSlipBridgeTests(unittest.TestCase):
         self.assertEqual(result["action"], "rewrite")
         self.assertEqual(handed_off, [str(local_path)])
 
+    def test_ocr_normalization_preserves_parsed_reference_no(self):
+        ocr_result = {
+            "parsed": {"reference_no": " SYNTHETIC-CANONICAL-001 ", "amount": 1}
+        }
+
+        normalized = self.module._normalize_ocr_result_for_handoff(ocr_result)
+
+        self.assertEqual(
+            normalized["parsed"]["reference_no"], "SYNTHETIC-CANONICAL-001"
+        )
+        self.assertEqual(
+            ocr_result["parsed"]["reference_no"], " SYNTHETIC-CANONICAL-001 "
+        )
+
+    def test_ocr_normalization_uses_fallback_key_or_labeled_text(self):
+        cases = (
+            (
+                {"parsed": {"ref_no": "SYNTHETIC-KEY-001"}},
+                "SYNTHETIC-KEY-001",
+            ),
+            (
+                {
+                    "parsed": {"amount": 1},
+                    "raw_ocr_text": "Amount 1.00\nReference No: SYNTHETIC-TEXT-001",
+                },
+                "SYNTHETIC-TEXT-001",
+            ),
+            (
+                {
+                    "parsed": {},
+                    "raw_ocr_text": "รหัสอ้างอิง: SYNTHETIC-THAI-001",
+                },
+                "SYNTHETIC-THAI-001",
+            ),
+        )
+        for ocr_result, expected in cases:
+            with self.subTest(expected=expected):
+                normalized = self.module._normalize_ocr_result_for_handoff(
+                    ocr_result
+                )
+                self.assertEqual(normalized["parsed"]["reference_no"], expected)
+
+    def test_ocr_normalization_without_reference_fails_closed(self):
+        with self.assertRaisesRegex(
+            ValueError, "OCR result requires reference_no after normalization"
+        ):
+            self.module._normalize_ocr_result_for_handoff({
+                "parsed": {"amount": 1},
+                "raw_ocr_text": "Amount: 1.00",
+            })
+
+    def test_text_reference_is_normalized_before_durable_handoff(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "staging"
+            environment = self._staging_environment(root)
+            local_path = root / "uploads" / "telegram-slip.jpg"
+            event = types.SimpleNamespace(
+                source=types.SimpleNamespace(
+                    platform="telegram", chat_id="1001", user_id="2001"
+                ),
+                media_urls=["https://example.invalid/slip.jpg"],
+                media_types=["image/jpeg"],
+                message_id="synthetic-message",
+            )
+            handed_off = []
+
+            def require_reference(*args, **kwargs):
+                reference_no = kwargs["ocr_result"].get("parsed", {}).get(
+                    "reference_no"
+                )
+                if not reference_no:
+                    raise ValueError("OCR result requires reference_no")
+                handed_off.append(reference_no)
+                return {"transaction": {"transaction_id": "synthetic-id"}}
+
+            buttons = types.SimpleNamespace(handoff_ocr_result=require_reference)
+            gateway = types.SimpleNamespace(adapters={
+                "telegram": types.SimpleNamespace(
+                    _bot=types.SimpleNamespace(id="3001")
+                )
+            })
+            with patch.dict(os.environ, environment, clear=True), patch.dict(
+                "sys.modules", {"lekza_accounting_transaction_buttons": buttons}
+            ), patch.object(
+                self.module, "_materialize_media", return_value=str(local_path)
+            ), patch.object(
+                self.module,
+                "call_akson_ocr",
+                return_value={
+                    "akson_called": True,
+                    "parsed": {"amount": 1},
+                    "raw_ocr_text": "Reference No: SYNTHETIC-HANDOFF-001",
+                },
+            ), patch.object(self.module.os, "makedirs"), patch(
+                "builtins.open", mock_open()
+            ):
+                result = self._image_hook()(event, gateway=gateway)
+
+        self.assertEqual(result["action"], "rewrite")
+        self.assertEqual(handed_off, ["SYNTHETIC-HANDOFF-001"])
+
     def test_handoff_failure_log_has_sanitized_truncated_error_message(self):
         secret_token = "synthetic-secret-token-value"
         file_url = "file:///synthetic/private/slip.jpg"
@@ -354,7 +455,10 @@ class AccountingSlipBridgeTests(unittest.TestCase):
             ), patch.object(
                 self.module,
                 "call_akson_ocr",
-                return_value={"akson_called": True, "parsed": {}},
+                return_value={
+                    "akson_called": True,
+                    "parsed": {"reference_no": "SYNTHETIC-DIAGNOSTIC-001"},
+                },
             ), patch.object(self.module.os, "makedirs"), patch(
                 "builtins.open", opened
             ):
