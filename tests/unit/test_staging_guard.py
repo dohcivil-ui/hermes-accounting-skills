@@ -1,6 +1,7 @@
 import importlib.util
 import os
 from pathlib import Path
+import shutil
 import tempfile
 import unittest
 
@@ -9,8 +10,8 @@ ROOT = Path(__file__).resolve().parents[2]
 GUARD_PATH = ROOT / "plugins/accounting-slip-bridge/staging_guard.py"
 
 
-def load_guard():
-    spec = importlib.util.spec_from_file_location("lekza_test_staging_guard", GUARD_PATH)
+def load_guard(path=GUARD_PATH):
+    spec = importlib.util.spec_from_file_location("lekza_test_staging_guard", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -92,6 +93,26 @@ class StagingGuardTests(unittest.TestCase):
         self.environment["LEKZA_TRANSACTION_STATE_DB"] = str(ROOT / "state.db")
         with self.assertRaisesRegex(ValueError, "repository checkout"):
             self.guard.validate_staging_environment(self.environment)
+
+    def test_deployed_plugin_does_not_treat_data_parent_as_repository(self):
+        data_root = Path(self.temp.name) / "data"
+        deployed_guard_path = (
+            data_root / "plugins" / "accounting-slip-bridge" / "staging_guard.py"
+        )
+        deployed_guard_path.parent.mkdir(parents=True)
+        shutil.copyfile(GUARD_PATH, deployed_guard_path)
+        deployed_guard = load_guard(deployed_guard_path)
+        staging_root = data_root / "lekza-staging"
+        environment = dict(self.environment)
+        environment["LEKZA_STAGING_DATA_ROOT"] = str(staging_root)
+        environment["LEKZA_TRANSACTION_STATE_DB"] = str(
+            staging_root / "state" / "transactions.db"
+        )
+        environment["LEKZA_ALLOWED_UPLOAD_ROOTS"] = str(staging_root / "uploads")
+
+        config = deployed_guard.validate_staging_environment(environment)
+
+        self.assertEqual(config["staging_data_root"], str(staging_root.resolve()))
 
     def test_paths_outside_explicit_staging_root_are_rejected(self):
         self.environment["LEKZA_TRANSACTION_STATE_DB"] = str(

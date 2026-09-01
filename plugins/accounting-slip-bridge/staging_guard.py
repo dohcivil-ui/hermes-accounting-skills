@@ -15,7 +15,16 @@ FORBIDDEN_APPLICATION_ROOTS = (
     Path("/data/plugins"),
     Path("/data/skills/accounting"),
 )
-REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _find_repository_root(module_path):
+    for candidate in module_path.resolve().parents:
+        if (candidate / ".git").exists():
+            return candidate
+    return None
+
+
+REPOSITORY_ROOT = _find_repository_root(Path(__file__))
 
 
 def _required(environment, name):
@@ -58,7 +67,9 @@ def _is_within(path, root):
 
 
 def _validate_external_staging_path(path, staging_root, name):
-    if path == REPOSITORY_ROOT or _is_within(path, REPOSITORY_ROOT):
+    if REPOSITORY_ROOT is not None and (
+        path == REPOSITORY_ROOT or _is_within(path, REPOSITORY_ROOT)
+    ):
         raise ValueError(f"{name} must be outside the repository checkout")
     if path == staging_root or not _is_within(path, staging_root):
         raise ValueError(f"{name} must be beneath {STAGING_DATA_ROOT_ENV}")
