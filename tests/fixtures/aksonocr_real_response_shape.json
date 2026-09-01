@@ -1,0 +1,12 @@
+{
+  "confidence": 1.0,
+  "parsed": {},
+  "pages": [
+    {
+      "markdown": "# Synthetic Transfer Slip\n\nReference: PHASED-SMOKE-20260901-01\n\nAmount: 1.00"
+    }
+  ],
+  "usage": {
+    "pages": 1
+  }
+}
