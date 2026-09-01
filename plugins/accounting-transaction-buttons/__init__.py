@@ -187,11 +187,31 @@ def _patch_module(mod_name, *, strict=False):
 
     async def handle_text(self, update, context, _original=original_text):
         message = getattr(update, "message", None)
+        if message is None:
+            message = getattr(update, "effective_message", None)
         text = getattr(message, "text", None)
+        chat_id_value = getattr(message, "chat_id", None)
+        if chat_id_value is None:
+            chat_id_value = getattr(
+                getattr(update, "effective_chat", None), "id", None
+            )
+        from_user = getattr(message, "from_user", None)
+        if from_user is None:
+            from_user = getattr(update, "effective_user", None)
+        user_id_value = getattr(from_user, "id", None)
+        _LOG.info("Lekza text handler entered")
+        _LOG.info(
+            "Lekza text extraction message_present=%s chat_present=%s "
+            "user_present=%s text_present=%s",
+            message is not None,
+            chat_id_value is not None,
+            user_id_value is not None,
+            bool(text),
+        )
         if text:
             try:
-                chat_id = str(getattr(message, "chat_id", ""))
-                user_id = str(getattr(getattr(message, "from_user", None), "id", ""))
+                chat_id = str(chat_id_value or "")
+                user_id = str(user_id_value or "")
                 _validate_staging_actor(chat_id, user_id)
                 result = await asyncio.to_thread(
                     _controller_from_environment().handle_manual_message,
@@ -199,6 +219,12 @@ def _patch_module(mod_name, *, strict=False):
                     platform="telegram",
                     chat_id=chat_id,
                     telegram_user_id=user_id,
+                )
+                _LOG.info(
+                    "Lekza manual result present=%s ok=%s prompt_present=%s",
+                    result is not None,
+                    bool(result and result.get("ok")),
+                    bool(result and result.get("prompt")),
                 )
                 if result is not None:
                     if result.get("prompt"):
@@ -208,9 +234,17 @@ def _patch_module(mod_name, *, strict=False):
                                 result["prompt"]["text"],
                                 reply_markup=_rows(mod, result["prompt"]),
                             )
+                    _LOG.info("Lekza text fallback original=false")
                     return
-            except Exception:
-                pass
+            except Exception as exc:
+                error_type = type(exc).__name__
+                if not error_type.isidentifier():
+                    error_type = "Exception"
+                _LOG.warning(
+                    "Lekza text handler failed error_type=%s fallback=true",
+                    error_type[:80],
+                )
+        _LOG.info("Lekza text fallback original=true")
         return await _original(self, update, context)
 
     async def send_lekza_transaction_prompt(

@@ -451,6 +451,104 @@ class TelegramTransactionWiringTests(unittest.TestCase):
         durable = self.flow.get_transaction(self.record["transaction_id"], **self.actor)
         self.assertEqual(durable["current_state"], "cancelled")
 
+    def test_runtime_patch_consumes_pending_reference_from_effective_message(self):
+        pending = self.controller.begin_from_ocr(
+            tenant_id="1001",
+            chat_id="1001",
+            thread_id=None,
+            session_id="effective-message-session",
+            handoff_id="effective-message-handoff",
+            telegram_user_id="2002",
+            source_image_path=self.slip,
+            ocr_result={"parsed": {}, "confidence": 1.0},
+        )
+        original_calls = []
+        replies = []
+
+        class Adapter:
+            async def _handle_callback_query(self, update, context):
+                return None
+
+            async def _handle_text_message(self, update, context):
+                original_calls.append("text")
+
+        class Button:
+            def __init__(self, text, callback_data):
+                self.text = text
+                self.callback_data = callback_data
+
+        class Markup:
+            def __init__(self, rows):
+                self.inline_keyboard = rows
+
+        class Message:
+            text = "MANUAL-REFERENCE-001"
+            chat_id = 1001
+            from_user = types.SimpleNamespace(id=2002)
+
+            async def reply_text(self, text, **kwargs):
+                replies.append((text, kwargs))
+
+        fake_name = "phase_c_effective_message_adapter"
+        fake_module = types.ModuleType(fake_name)
+        fake_module.TelegramAdapter = Adapter
+        fake_module.InlineKeyboardButton = Button
+        fake_module.InlineKeyboardMarkup = Markup
+        sys.modules[fake_name] = fake_module
+        plugin = load_module("lekza_phase_c_effective_message_plugin", PLUGIN_PATH)
+        plugin._set_controller_for_tests(self.controller)
+        self.assertTrue(plugin._patch_module(fake_name))
+
+        update = types.SimpleNamespace(
+            effective_message=Message(),
+            effective_user=types.SimpleNamespace(id=2002),
+        )
+        try:
+            with patch.dict(
+                os.environ, {"LEKZA_RUNTIME_ENV": "production"}
+            ), self.assertLogs(
+                "lekza.accounting_transaction_buttons", level="INFO"
+            ) as captured:
+                adapter = Adapter()
+                asyncio.run(adapter._handle_text_message(update, None))
+
+            success_logs = "\n".join(captured.output)
+            self.assertIn("message_present=True", success_logs)
+            self.assertIn("text_present=True", success_logs)
+            self.assertIn("manual result present=True", success_logs)
+            self.assertIn("fallback original=false", success_logs)
+            self.assertNotIn(Message.text, success_logs)
+            self.assertNotIn("1001", success_logs)
+            self.assertNotIn("2002", success_logs)
+
+            sensitive_exception = "token=synthetic-secret raw customer text"
+            with patch.dict(
+                os.environ, {"LEKZA_RUNTIME_ENV": "production"}
+            ), patch.object(
+                self.controller,
+                "handle_manual_message",
+                side_effect=RuntimeError(sensitive_exception),
+            ), self.assertLogs(
+                "lekza.accounting_transaction_buttons", level="WARNING"
+            ) as failed:
+                asyncio.run(adapter._handle_text_message(update, None))
+
+            failure_logs = "\n".join(failed.output)
+            self.assertIn("error_type=RuntimeError", failure_logs)
+            self.assertIn("fallback=true", failure_logs)
+            self.assertNotIn(sensitive_exception, failure_logs)
+            self.assertNotIn(Message.text, failure_logs)
+            self.assertNotIn("1001", failure_logs)
+            self.assertNotIn("2002", failure_logs)
+        finally:
+            sys.modules.pop(fake_name, None)
+
+        durable = self.flow.get_transaction(pending["transaction_id"], **self.actor)
+        self.assertEqual(original_calls, ["text"])
+        self.assertEqual(durable["reference_no"], "MANUAL-REFERENCE-001")
+        self.assertFalse(durable["needs_reference"])
+        self.assertEqual(len(replies), 1)
+
     def test_image_ocr_handoff_creates_once_and_renders_initial_buttons(self):
         sent = []
 
