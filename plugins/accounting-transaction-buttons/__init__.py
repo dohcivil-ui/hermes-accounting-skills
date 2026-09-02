@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import sys
 import threading
+import time
 
 
 _PATCH_ATTR = "_lekza_transaction_buttons_v1"
@@ -18,6 +19,7 @@ _CONTROLLER = None
 _CONTROLLER_LOCK = threading.Lock()
 _MODULE_CACHE = {}
 _LOG = logging.getLogger("lekza.accounting_transaction_buttons")
+_STARTUP_REBIND_TIMEOUT_SECONDS = 30.0
 
 
 class AdapterCompatibilityError(RuntimeError):
@@ -310,6 +312,65 @@ def _rebind_loaded_adapter_instances():
     return rebound
 
 
+def _registered_handler_counts():
+    """Count handlers already bound to the currently patched methods."""
+    counts = {"text": 0, "callback": 0}
+    adapter_classes = {
+        getattr(sys.modules.get(name), "TelegramAdapter", None)
+        for name in (
+            "hermes_plugins.telegram_platform.adapter",
+            "plugins.platforms.telegram.adapter",
+        )
+    }
+    adapter_classes.discard(None)
+    for candidate in gc.get_objects():
+        if type(candidate) not in adapter_classes:
+            continue
+        handlers = getattr(getattr(candidate, "_app", None), "handlers", None)
+        if not isinstance(handlers, dict):
+            continue
+        expected = {
+            getattr(candidate._handle_text_message, "__func__", None): "text",
+            getattr(candidate._handle_callback_query, "__func__", None): "callback",
+        }
+        for group in handlers.values():
+            for handler in group:
+                callback = getattr(handler, "callback", None)
+                if getattr(callback, "__self__", None) is not candidate:
+                    continue
+                kind = expected.get(getattr(callback, "__func__", callback))
+                if kind is not None:
+                    counts[kind] += 1
+    return counts
+
+
+def _watch_for_registered_handlers():
+    deadline = time.monotonic() + _STARTUP_REBIND_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        _patch_loaded_adapter()
+        _rebind_loaded_adapter_instances()
+        counts = _registered_handler_counts()
+        if counts["text"] and counts["callback"]:
+            _LOG.info(
+                "Lekza Telegram startup handler ready text=%s callback=%s",
+                counts["text"],
+                counts["callback"],
+            )
+            return
+        time.sleep(0.1)
+    _LOG.error("Lekza Telegram startup handler rebind timed out")
+
+
+def _start_registered_handler_watch():
+    thread = threading.Thread(
+        target=_watch_for_registered_handlers,
+        name="lekza-telegram-handler-rebind",
+        daemon=True,
+    )
+    thread.start()
+    return thread
+
+
 def _rebind_registered_handlers(adapter):
     """Point already-registered PTB handlers at the patched adapter methods."""
     app = getattr(adapter, "_app", None)
@@ -467,3 +528,4 @@ def register(ctx):
     ctx.register_hook("pre_gateway_dispatch", pre_gateway_dispatch)
     _patch_loaded_adapter()
     _rebind_loaded_adapter_instances()
+    _start_registered_handler_watch()

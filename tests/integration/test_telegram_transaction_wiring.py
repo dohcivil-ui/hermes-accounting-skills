@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+import time
 import types
 import unittest
 from unittest.mock import mock_open, patch
@@ -693,6 +694,64 @@ class TelegramTransactionWiringTests(unittest.TestCase):
             self.assertEqual(original_calls, [])
         finally:
             sys.modules.pop(fake_name, None)
+
+    def test_startup_watch_rebinds_adapter_created_after_plugin_registration(self):
+        class Handler:
+            def __init__(self, callback):
+                self.callback = callback
+
+        fake_name = "hermes_plugins.telegram_platform.adapter"
+        previous = sys.modules.pop(fake_name, None)
+        plugin = load_module("lekza_phase_c_startup_watch_plugin", PLUGIN_PATH)
+        plugin._STARTUP_REBIND_TIMEOUT_SECONDS = 2.0
+
+        class Context:
+            def register_hook(self, name, callback):
+                self.name = name
+                self.callback = callback
+
+        try:
+            with self.assertLogs(
+                "lekza.accounting_transaction_buttons", level="INFO"
+            ) as captured:
+                plugin.register(Context())
+
+                class Adapter:
+                    async def _handle_callback_query(self, update, context):
+                        return None
+
+                    async def _handle_text_message(self, update, context):
+                        return None
+
+                Adapter.__module__ = fake_name
+                fake_module = types.ModuleType(fake_name)
+                fake_module.TelegramAdapter = Adapter
+                sys.modules[fake_name] = fake_module
+                adapter = Adapter()
+                text_handler = Handler(adapter._handle_text_message)
+                callback_handler = Handler(adapter._handle_callback_query)
+                adapter._app = types.SimpleNamespace(
+                    handlers={0: [text_handler, callback_handler]}
+                )
+                deadline = time.monotonic() + 2.0
+                while "startup handler ready text=1 callback=1" not in "\n".join(
+                    captured.output
+                ):
+                    if time.monotonic() >= deadline:
+                        self.fail("startup handler watch did not become ready")
+                    time.sleep(0.02)
+
+            self.assertIs(
+                text_handler.callback.__func__, Adapter._handle_text_message
+            )
+            self.assertIs(
+                callback_handler.callback.__func__,
+                Adapter._handle_callback_query,
+            )
+        finally:
+            sys.modules.pop(fake_name, None)
+            if previous is not None:
+                sys.modules[fake_name] = previous
 
     def test_image_ocr_handoff_creates_once_and_renders_initial_buttons(self):
         sent = []
