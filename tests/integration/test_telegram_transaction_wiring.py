@@ -640,6 +640,60 @@ class TelegramTransactionWiringTests(unittest.TestCase):
         self.assertFalse(durable["needs_reference"])
         self.assertEqual(len(replies), 1)
 
+    def test_plugin_registration_rebinds_handlers_captured_before_patch(self):
+        original_calls = []
+
+        class Adapter:
+            async def _handle_callback_query(self, update, context):
+                original_calls.append("callback")
+
+            async def _handle_text_message(self, update, context):
+                original_calls.append("text")
+
+        class Handler:
+            def __init__(self, callback):
+                self.callback = callback
+
+        fake_name = "hermes_plugins.telegram_platform.adapter"
+        Adapter.__module__ = fake_name
+        fake_module = types.ModuleType(fake_name)
+        fake_module.TelegramAdapter = Adapter
+        sys.modules[fake_name] = fake_module
+        adapter = Adapter()
+        text_handler = Handler(adapter._handle_text_message)
+        callback_handler = Handler(adapter._handle_callback_query)
+        adapter._app = types.SimpleNamespace(
+            handlers={0: [text_handler, callback_handler]}
+        )
+        plugin = load_module(
+            "lekza_phase_c_registration_rebind_plugin", PLUGIN_PATH
+        )
+
+        class Context:
+            def register_hook(self, name, callback):
+                self.name = name
+                self.callback = callback
+
+        try:
+            with self.assertLogs(
+                "lekza.accounting_transaction_buttons", level="INFO"
+            ) as captured:
+                plugin.register(Context())
+            self.assertIn(
+                "registered handler rebind text=1 callback=1",
+                "\n".join(captured.output),
+            )
+            self.assertIs(
+                text_handler.callback.__func__, Adapter._handle_text_message
+            )
+            self.assertIs(
+                callback_handler.callback.__func__,
+                Adapter._handle_callback_query,
+            )
+            self.assertEqual(original_calls, [])
+        finally:
+            sys.modules.pop(fake_name, None)
+
     def test_image_ocr_handoff_creates_once_and_renders_initial_buttons(self):
         sent = []
 

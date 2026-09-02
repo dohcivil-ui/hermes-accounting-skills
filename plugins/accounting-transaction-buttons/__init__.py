@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import importlib.util
 import json
 import logging
@@ -287,6 +288,28 @@ def _patch_loaded_adapter():
     return patched
 
 
+def _rebind_loaded_adapter_instances():
+    """Repair callbacks captured before this plugin patched the adapter class."""
+    rebound = {"text": 0, "callback": 0}
+    adapter_classes = {
+        getattr(sys.modules.get(name), "TelegramAdapter", None)
+        for name in (
+            "hermes_plugins.telegram_platform.adapter",
+            "plugins.platforms.telegram.adapter",
+        )
+    }
+    adapter_classes.discard(None)
+    if not adapter_classes:
+        return rebound
+    for candidate in gc.get_objects():
+        if type(candidate) not in adapter_classes:
+            continue
+        counts = _rebind_registered_handlers(candidate)
+        rebound["text"] += counts["text"]
+        rebound["callback"] += counts["callback"]
+    return rebound
+
+
 def _rebind_registered_handlers(adapter):
     """Point already-registered PTB handlers at the patched adapter methods."""
     app = getattr(adapter, "_app", None)
@@ -443,3 +466,4 @@ def register(ctx):
 
     ctx.register_hook("pre_gateway_dispatch", pre_gateway_dispatch)
     _patch_loaded_adapter()
+    _rebind_loaded_adapter_instances()
