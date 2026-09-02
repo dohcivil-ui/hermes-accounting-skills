@@ -267,7 +267,7 @@ class AccountingSlipBridgeTests(unittest.TestCase):
                 result = self._image_hook()(event, gateway=gateway)
 
             materialized = Path(handed_off[0])
-            self.assertEqual(result["action"], "rewrite")
+            self.assertEqual(result, {"action": "skip"})
             self.assertEqual(
                 materialized.parent, (staging_root / "uploads").resolve()
             )
@@ -312,7 +312,7 @@ class AccountingSlipBridgeTests(unittest.TestCase):
             ):
                 result = self._image_hook()(event, gateway=gateway)
 
-        self.assertEqual(result["action"], "rewrite")
+        self.assertEqual(result, {"action": "skip"})
         self.assertEqual(handed_off, [str(local_path)])
 
     def test_ocr_normalization_preserves_parsed_reference_no(self):
@@ -433,7 +433,7 @@ class AccountingSlipBridgeTests(unittest.TestCase):
             ):
                 result = self._image_hook()(event, gateway=gateway)
 
-        self.assertEqual(result["action"], "rewrite")
+        self.assertEqual(result, {"action": "skip"})
         self.assertEqual(handed_off, ["SYNTHETIC-HANDOFF-001"])
 
     def test_handoff_failure_log_has_sanitized_truncated_error_message(self):

@@ -527,6 +527,9 @@ def register(ctx):
                         except OSError:
                             pass
 
+                if durable_handoff:
+                    return {"action": "skip"}
+
                 rewrite_text = f"""[AksonOCR Slip Result]
 - OCR source: AksonOCR (Vision OCR is strictly prohibited for this slip)
 - confidence: {confidence}

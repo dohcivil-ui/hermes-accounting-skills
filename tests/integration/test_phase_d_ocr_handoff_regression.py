@@ -293,7 +293,7 @@ class PhaseDOcrHandoffRegressionTests(unittest.TestCase):
                 event, gateway=types.SimpleNamespace(adapters={})
             )
 
-        self.assertEqual(result["action"], "rewrite")
+        self.assertEqual(result, {"action": "skip"})
         self.assertEqual(len(handed_off), 1)
         self.assertEqual(handed_off[0]["parsed"]["reference_no"], REFERENCE_NO)
         self.assertEqual(ocr_result["parsed"], {})
