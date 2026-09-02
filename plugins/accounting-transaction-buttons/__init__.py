@@ -287,6 +287,43 @@ def _patch_loaded_adapter():
     return patched
 
 
+def _rebind_registered_handlers(adapter):
+    """Point already-registered PTB handlers at the patched adapter methods."""
+    app = getattr(adapter, "_app", None)
+    handlers = getattr(app, "handlers", None)
+    if not isinstance(handlers, dict):
+        return {"text": 0, "callback": 0}
+
+    rebound = {"text": 0, "callback": 0}
+    replacements = {
+        "_handle_text_message": ("text", adapter._handle_text_message),
+        "_handle_callback_query": ("callback", adapter._handle_callback_query),
+    }
+    for group in handlers.values():
+        for handler in group:
+            callback = getattr(handler, "callback", None)
+            if getattr(callback, "__self__", None) is not adapter:
+                continue
+            function = getattr(callback, "__func__", callback)
+            replacement = replacements.get(getattr(function, "__name__", ""))
+            if replacement is None:
+                continue
+            kind, patched_callback = replacement
+            try:
+                handler.callback = patched_callback
+            except Exception as exc:
+                raise AdapterCompatibilityError(
+                    f"Hermes Telegram registered {kind} handler cannot be rebound"
+                ) from exc
+            rebound[kind] += 1
+    _LOG.info(
+        "Lekza Telegram registered handler rebind text=%s callback=%s",
+        rebound["text"],
+        rebound["callback"],
+    )
+    return rebound
+
+
 def _telegram_adapter(gateway):
     adapters = getattr(gateway, "adapters", {}) or {}
     for key, adapter in adapters.items():
@@ -299,6 +336,7 @@ def _telegram_adapter(gateway):
                     "Loaded Telegram adapter class cannot be resolved to its module"
                 )
             _patch_module(module_name, strict=True)
+            _rebind_registered_handlers(adapter)
             return adapter
     raise AdapterCompatibilityError("Gateway has no loaded Telegram adapter")
 

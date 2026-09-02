@@ -549,6 +549,97 @@ class TelegramTransactionWiringTests(unittest.TestCase):
         self.assertFalse(durable["needs_reference"])
         self.assertEqual(len(replies), 1)
 
+    def test_runtime_patch_rebinds_already_registered_text_handler(self):
+        pending = self.controller.begin_from_ocr(
+            tenant_id="1001",
+            chat_id="1001",
+            thread_id=None,
+            session_id="registered-handler-session",
+            handoff_id="registered-handler-handoff",
+            telegram_user_id="2002",
+            source_image_path=self.slip,
+            ocr_result={"parsed": {}, "confidence": 1.0},
+        )
+        original_calls = []
+        replies = []
+
+        class Adapter:
+            async def _handle_callback_query(self, update, context):
+                original_calls.append("callback")
+
+            async def _handle_text_message(self, update, context):
+                original_calls.append("text")
+
+        class Handler:
+            def __init__(self, callback):
+                self.callback = callback
+
+        class Button:
+            def __init__(self, text, callback_data):
+                self.text = text
+                self.callback_data = callback_data
+
+        class Markup:
+            def __init__(self, rows):
+                self.inline_keyboard = rows
+
+        class Message:
+            text = "REGISTERED-HANDLER-REFERENCE"
+            chat_id = 1001
+            from_user = types.SimpleNamespace(id=2002)
+
+            async def reply_text(self, text, **kwargs):
+                replies.append((text, kwargs))
+
+        fake_name = "phase_c_registered_telegram_adapter"
+        Adapter.__module__ = fake_name
+        fake_module = types.ModuleType(fake_name)
+        fake_module.TelegramAdapter = Adapter
+        fake_module.InlineKeyboardButton = Button
+        fake_module.InlineKeyboardMarkup = Markup
+        sys.modules[fake_name] = fake_module
+        plugin = load_module("lekza_phase_c_registered_plugin", PLUGIN_PATH)
+        plugin._set_controller_for_tests(self.controller)
+
+        adapter = Adapter()
+        registered_text = Handler(adapter._handle_text_message)
+        registered_callback = Handler(adapter._handle_callback_query)
+        adapter._app = types.SimpleNamespace(
+            handlers={0: [registered_text, registered_callback]}
+        )
+        gateway = types.SimpleNamespace(adapters={"telegram": adapter})
+        update = types.SimpleNamespace(
+            effective_message=Message(),
+            effective_user=types.SimpleNamespace(id=2002),
+        )
+
+        try:
+            with patch.dict(
+                os.environ, {"LEKZA_RUNTIME_ENV": "production"}
+            ), self.assertLogs(
+                "lekza.accounting_transaction_buttons", level="INFO"
+            ) as captured:
+                self.assertIs(plugin._telegram_adapter(gateway), adapter)
+                asyncio.run(registered_text.callback(update, None))
+
+            logs = "\n".join(captured.output)
+            self.assertIn("registered handler rebind text=1 callback=1", logs)
+            self.assertIn("fallback original=false", logs)
+            self.assertEqual(original_calls, [])
+            self.assertIs(
+                registered_text.callback.__func__, Adapter._handle_text_message
+            )
+            self.assertIs(
+                registered_callback.callback.__func__, Adapter._handle_callback_query
+            )
+        finally:
+            sys.modules.pop(fake_name, None)
+
+        durable = self.flow.get_transaction(pending["transaction_id"], **self.actor)
+        self.assertEqual(durable["reference_no"], "REGISTERED-HANDLER-REFERENCE")
+        self.assertFalse(durable["needs_reference"])
+        self.assertEqual(len(replies), 1)
+
     def test_image_ocr_handoff_creates_once_and_renders_initial_buttons(self):
         sent = []
 
