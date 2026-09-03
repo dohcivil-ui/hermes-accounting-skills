@@ -4,6 +4,7 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 import unittest
+from unittest import mock
 import tempfile
 
 
@@ -276,6 +277,66 @@ class RuntimePathSafetyTests(unittest.TestCase):
             self.assertEqual(paths["ledger"], external_root / "state" / "reports.sqlite3")
             self.assertEqual(paths["archive"], external_root / "archive")
             self.assertEqual(paths["font"], external_root / "thai-font.ttf")
+
+    def test_hostinger_layout_accepts_persistent_production_data(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data_root = Path(directory).resolve() / "data"
+            production_root = data_root / "lekza-production"
+            production_root.mkdir(parents=True)
+            script_path = (
+                data_root
+                / "skills/accounting/scheduled-project-report/scripts/run_report.py"
+            )
+
+            with (
+                mock.patch.object(self.runner, "__file__", str(script_path)),
+                mock.patch.object(self.runner, "_HOSTINGER_DATA_ROOT", data_root),
+            ):
+                paths = self.runner.resolve_runtime_paths(
+                    self.environment(production_root)
+                )
+
+            self.assertEqual(
+                paths["ledger"], production_root / "state" / "reports.sqlite3"
+            )
+            self.assertEqual(paths["archive"], production_root / "archive")
+            self.assertEqual(paths["font"], production_root / "thai-font.ttf")
+
+    def test_hostinger_layout_rejects_skills_and_plugins_source_trees(self):
+        names = (
+            "LEKZA_REPORT_LEDGER_DB",
+            "LEKZA_REPORT_ARCHIVE_ROOT",
+            "LEKZA_REPORT_THAI_FONT_PATH",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            data_root = Path(directory).resolve() / "data"
+            production_root = data_root / "lekza-production"
+            production_root.mkdir(parents=True)
+            script_path = (
+                data_root
+                / "skills/accounting/scheduled-project-report/scripts/run_report.py"
+            )
+            environment = self.environment(production_root)
+            for name in names:
+                for source_path in (
+                    data_root / "skills",
+                    data_root / "skills" / "accounting" / "state",
+                    data_root / "plugins",
+                    data_root / "plugins" / "report-state",
+                ):
+                    candidate = dict(environment)
+                    candidate[name] = str(source_path)
+                    with self.subTest(name=name, source_path=source_path):
+                        with self.assertRaises(ValueError):
+                            with (
+                                mock.patch.object(
+                                    self.runner, "__file__", str(script_path)
+                                ),
+                                mock.patch.object(
+                                    self.runner, "_HOSTINGER_DATA_ROOT", data_root
+                                ),
+                            ):
+                                self.runner.resolve_runtime_paths(candidate)
 
 
 if __name__ == "__main__":
