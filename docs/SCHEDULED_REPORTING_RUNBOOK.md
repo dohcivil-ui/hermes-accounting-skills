@@ -29,15 +29,17 @@ in Git:
 - `LEKZA_REPORT_TELEGRAM_BOT_TOKEN`
 - `LEKZA_REPORT_TELEGRAM_CHAT_ID`
 - Optional `LEKZA_REPORT_TELEGRAM_THREAD_ID`
-- `LEKZA_REPORT_LEDGER_DB`: absolute SQLite path outside the resolved repository/runtime source root
-- `LEKZA_REPORT_ARCHIVE_ROOT`: absolute monthly-PDF archive root outside the resolved repository/runtime source root
-- `LEKZA_REPORT_THAI_FONT_PATH`: absolute Thai-capable TTF path outside the resolved repository/runtime source root, such as Noto Sans Thai or TH Sarabun New
+- `LEKZA_REPORT_LEDGER_DB`: absolute SQLite path outside the active source boundaries
+- `LEKZA_REPORT_ARCHIVE_ROOT`: absolute monthly-PDF archive root outside the active source boundaries
+- `LEKZA_REPORT_THAI_FONT_PATH`: absolute Thai-capable TTF path outside the active source boundaries, such as Noto Sans Thai or TH Sarabun New
 - Optional `LEKZA_REPORT_DELIVERY_LEASE_SECONDS`
 
-The archive, ledger, font, credentials, and generated artifacts must remain
-outside the complete repository/runtime source tree, not merely outside the
-`skills` and `plugins` subdirectories. Restrict the ledger and archive
-directories to the runtime user.
+For a local checkout, the complete resolved Git repository is the source
+boundary. On Hostinger, the runtime source boundaries are `/data/skills` and
+`/data/plugins`; neither those directories nor any descendant may contain the
+archive, ledger, or font. Persistent production paths beneath
+`/data/lekza-production` are outside those source boundaries and are allowed.
+Restrict the ledger and archive directories to the runtime user.
 
 ## Cron schedule
 

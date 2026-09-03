@@ -47,6 +47,11 @@ SQLite ledger stored outside source control. Monthly PDFs are archived beneath
 an environment-configured external root and use an environment-configured
 embedded Thai font.
 
+Report runtime paths use layout-aware source boundaries. A local checkout
+rejects the resolved repository root and every descendant. The Hostinger
+layout rejects `/data/skills` and `/data/plugins` and every descendant while
+allowing persistent data beneath `/data/lekza-production`.
+
 The ledger identity includes report type, reporting period, Telegram
 destination, artifact/message type, and chunk index. States are
 `pending -> delivering -> delivered`. Telegram has no server-side idempotency

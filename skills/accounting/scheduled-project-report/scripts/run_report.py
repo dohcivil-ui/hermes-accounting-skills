@@ -20,6 +20,9 @@ from scheduled_reporting import (
 )
 
 
+_HOSTINGER_DATA_ROOT = Path("/data")
+
+
 def _required(environment, name):
     value = str(environment.get(name) or "").strip()
     if not value:
@@ -27,31 +30,47 @@ def _required(environment, name):
     return value
 
 
-def _absolute_external_path(environment, name, source_root, *, must_exist=False):
+def _absolute_external_path(environment, name, source_roots, *, must_exist=False):
     path = Path(_required(environment, name))
     if not path.is_absolute():
         raise ValueError(f"{name} must be an absolute path")
     resolved = path.resolve()
-    source_root = Path(source_root).resolve()
-    if resolved == source_root or resolved.is_relative_to(source_root):
-        raise ValueError(f"{name} must be outside the repository/runtime source root")
+    for source_root in source_roots:
+        source_root = Path(source_root).resolve()
+        if resolved == source_root or resolved.is_relative_to(source_root):
+            raise ValueError(
+                f"{name} must be outside the repository/runtime source roots"
+            )
     if must_exist and not resolved.is_file():
         raise ValueError(f"{name} must identify an existing file")
     return resolved
 
 
+def _runtime_source_roots():
+    script_path = Path(__file__).resolve()
+    skills_root = script_path.parents[3]
+    layout_root = skills_root.parent
+    hostinger_data_root = _HOSTINGER_DATA_ROOT.resolve()
+    if skills_root == (hostinger_data_root / "skills").resolve():
+        return (
+            skills_root,
+            (hostinger_data_root / "plugins").resolve(),
+        )
+    return (layout_root,)
+
+
 def resolve_runtime_paths(environment):
-    """Resolve report state paths and reject the complete source tree."""
-    source_root = Path(__file__).resolve().parents[4]
+    """Resolve report state paths outside the active source boundaries."""
+    source_roots = _runtime_source_roots()
     return {
         "ledger": _absolute_external_path(
-            environment, "LEKZA_REPORT_LEDGER_DB", source_root
+            environment, "LEKZA_REPORT_LEDGER_DB", source_roots
         ),
         "archive": _absolute_external_path(
-            environment, "LEKZA_REPORT_ARCHIVE_ROOT", source_root
+            environment, "LEKZA_REPORT_ARCHIVE_ROOT", source_roots
         ),
         "font": _absolute_external_path(
-            environment, "LEKZA_REPORT_THAI_FONT_PATH", source_root,
+            environment, "LEKZA_REPORT_THAI_FONT_PATH", source_roots,
             must_exist=True,
         ),
     }
