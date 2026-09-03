@@ -344,10 +344,6 @@ class SQLiteStateStore:
                 WHERE current_state <> 'cancelled' AND needs_reference = 0
                 """
             )
-            self._connection.commit()
-        except Exception:
-            self._connection.rollback()
-            raise
             self._connection.execute(
                 """
                 UPDATE transaction_state
@@ -363,6 +359,10 @@ class SQLiteStateStore:
                 ON transaction_state(handoff_key) WHERE handoff_key IS NOT NULL
                 """
             )
+            self._connection.commit()
+        except Exception:
+            self._connection.rollback()
+            raise
 
     def create(self, record):
         columns = tuple(record)

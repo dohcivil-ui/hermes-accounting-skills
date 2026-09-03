@@ -235,6 +235,66 @@ class MissingReferenceSchemaMigrationTests(unittest.TestCase):
         self.assertEqual(errors, [])
         self.assertEqual(states, [("waiting_review", 7, True)] * 2)
 
+    def test_fresh_database_creates_unique_handoff_index(self):
+        fresh_path = self.root / "state" / "fresh.sqlite3"
+        store = self.module.SQLiteStateStore(fresh_path)
+        try:
+            indexes = {
+                row["name"]
+                for row in store._connection.execute(
+                    "PRAGMA index_list(transaction_state)"
+                )
+            }
+            self.assertIn("uq_transaction_handoff", indexes)
+        finally:
+            store.close()
+
+    def test_duplicate_handoff_key_recovers_existing_transaction(self):
+        store, flow = self._open()
+        try:
+            first = self._begin_missing(flow, "duplicate-handoff")
+            duplicate = self._begin_missing(flow, "duplicate-handoff")
+            count = store._connection.execute(
+                "SELECT COUNT(*) FROM transaction_state WHERE handoff_key = ?",
+                ("duplicate-handoff",),
+            ).fetchone()[0]
+
+            self.assertEqual(duplicate["transaction_id"], first["transaction_id"])
+            self.assertEqual(count, 1)
+        finally:
+            store.close()
+
+    def test_legacy_prompt_message_migrates_to_delivered(self):
+        connection = sqlite3.connect(self.db_path)
+        try:
+            connection.execute(
+                """
+                UPDATE transaction_state
+                SET initial_prompt_message_id = ?, initial_prompt_state = 'pending',
+                    initial_prompt_owner = ?, initial_prompt_lease_expires_at = ?
+                WHERE transaction_id = ?
+                """,
+                (
+                    "legacy-message-id",
+                    "legacy-owner",
+                    "2099-01-01T00:00:00+00:00",
+                    self.transaction_id,
+                ),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        store, flow = self._open()
+        try:
+            record = flow.get_transaction(self.transaction_id, **self.actor)
+            self.assertEqual(record["initial_prompt_state"], "delivered")
+            self.assertIsNone(record["initial_prompt_owner"])
+            self.assertIsNone(record["initial_prompt_lease_expires_at"])
+            self.assertEqual(record["initial_prompt_message_id"], "legacy-message-id")
+        finally:
+            store.close()
+
     def test_missing_rows_coexist_and_reference_assignment_is_unique(self):
         store, flow = self._open()
         try:
