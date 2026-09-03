@@ -85,6 +85,14 @@ class InvalidTransitionError(TransactionStateError):
     """The requested state transition is invalid from the current state."""
 
 
+class MultipleManualPendingError(TransactionStateError):
+    """The actor must explicitly select one pending manual transaction."""
+
+    def __init__(self, records):
+        super().__init__("Multiple manual inputs are pending")
+        self.records = tuple(records)
+
+
 class UnsafeSourcePathError(TransactionStateError):
     """The source slip is outside the approved runtime file policy."""
 
@@ -252,6 +260,15 @@ class SQLiteStateStore:
             ON transaction_state(platform, chat_id, telegram_user_id);
             CREATE INDEX IF NOT EXISTS idx_transaction_state
             ON transaction_state(current_state, updated_at);
+            CREATE TABLE IF NOT EXISTS manual_input_selection (
+                platform TEXT NOT NULL,
+                chat_id TEXT NOT NULL,
+                telegram_user_id TEXT NOT NULL,
+                transaction_id TEXT NOT NULL,
+                expected_version INTEGER NOT NULL,
+                selected_at TEXT NOT NULL,
+                PRIMARY KEY (platform, chat_id, telegram_user_id)
+            );
             """
         )
         self._connection.commit()
@@ -282,6 +299,19 @@ class SQLiteStateStore:
                 self._connection.execute(
                     f"ALTER TABLE transaction_state ADD COLUMN {column} {definition}"
                 )
+            self._connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS manual_input_selection (
+                    platform TEXT NOT NULL,
+                    chat_id TEXT NOT NULL,
+                    telegram_user_id TEXT NOT NULL,
+                    transaction_id TEXT NOT NULL,
+                    expected_version INTEGER NOT NULL,
+                    selected_at TEXT NOT NULL,
+                    PRIMARY KEY (platform, chat_id, telegram_user_id)
+                )
+                """
+            )
             for row in self._connection.execute(
                 """
                 SELECT transaction_id, ocr_fields_json, current_state
@@ -383,7 +413,7 @@ class SQLiteStateStore:
         ).fetchone()
         return self._decode(row) if row is not None else None
 
-    def get_manual_pending(self, *, platform, chat_id, telegram_user_id):
+    def list_manual_pending(self, *, platform, chat_id, telegram_user_id):
         rows = self._connection.execute(
             """
             SELECT * FROM transaction_state
@@ -391,13 +421,55 @@ class SQLiteStateStore:
               AND current_state NOT IN ('confirmed', 'cancelled', 'failed')
               AND entry_mode IS NOT NULL
             ORDER BY updated_at DESC
-            LIMIT 2
             """,
             (str(platform), str(chat_id), str(telegram_user_id)),
         ).fetchall()
-        if len(rows) > 1:
-            raise TransactionStateError("Multiple manual inputs are pending")
-        return self._decode(rows[0]) if rows else None
+        return [self._decode(row) for row in rows]
+
+    def get_manual_selection(self, *, platform, chat_id, telegram_user_id):
+        row = self._connection.execute(
+            """
+            SELECT transaction_id, expected_version
+            FROM manual_input_selection
+            WHERE platform = ? AND chat_id = ? AND telegram_user_id = ?
+            """,
+            (str(platform), str(chat_id), str(telegram_user_id)),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def set_manual_selection(
+        self, transaction_id, expected_version, *, platform, chat_id,
+        telegram_user_id
+    ):
+        with self._connection:
+            self._connection.execute(
+                """
+                INSERT INTO manual_input_selection (
+                    platform, chat_id, telegram_user_id, transaction_id,
+                    expected_version, selected_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(platform, chat_id, telegram_user_id) DO UPDATE SET
+                    transaction_id = excluded.transaction_id,
+                    expected_version = excluded.expected_version,
+                    selected_at = excluded.selected_at
+                """,
+                (str(platform), str(chat_id), str(telegram_user_id),
+                 str(transaction_id), int(expected_version), _utc_now()),
+            )
+
+    def clear_manual_selection(
+        self, *, platform, chat_id, telegram_user_id, transaction_id=None
+    ):
+        sql = (
+            "DELETE FROM manual_input_selection "
+            "WHERE platform = ? AND chat_id = ? AND telegram_user_id = ?"
+        )
+        values = [str(platform), str(chat_id), str(telegram_user_id)]
+        if transaction_id is not None:
+            sql += " AND transaction_id = ?"
+            values.append(str(transaction_id))
+        with self._connection:
+            self._connection.execute(sql, values)
 
     def acquire_initial_prompt_delivery(
         self,
@@ -926,10 +998,55 @@ class TransactionFlow:
         return dict(record)
 
     def get_manual_pending(self, *, platform, chat_id, telegram_user_id):
-        return self._store.get_manual_pending(
+        actor = {
+            "platform": platform, "chat_id": chat_id,
+            "telegram_user_id": telegram_user_id,
+        }
+        selected = self._store.get_manual_selection(**actor)
+        if selected is not None:
+            record = self._require_authorized(selected["transaction_id"], **actor)
+            if record["version"] != int(selected["expected_version"]):
+                self._store.clear_manual_selection(**actor)
+                raise StaleStateError("Selected manual transaction is stale")
+            if record.get("entry_mode") is None or record["current_state"] in {
+                "confirmed", "cancelled", "failed"
+            }:
+                self._store.clear_manual_selection(**actor)
+                raise InvalidTransitionError("Selected manual input is no longer pending")
+            return dict(record)
+        records = self._store.list_manual_pending(
+            **actor
+        )
+        if len(records) > 1:
+            raise MultipleManualPendingError(records)
+        return records[0] if records else None
+
+    def select_manual_pending(
+        self, transaction_id, *, expected_version, platform, chat_id,
+        telegram_user_id
+    ):
+        record = self._require_authorized(
+            transaction_id, platform, chat_id, telegram_user_id
+        )
+        self._require_current_version(record, expected_version)
+        if record.get("entry_mode") is None or record["current_state"] in {
+            "confirmed", "cancelled", "failed"
+        }:
+            raise InvalidTransitionError("Transaction has no pending manual input")
+        self._store.set_manual_selection(
+            transaction_id, expected_version,
             platform=platform,
             chat_id=chat_id,
             telegram_user_id=telegram_user_id,
+        )
+        return self._view(record)
+
+    def clear_manual_selection(
+        self, transaction_id, *, platform, chat_id, telegram_user_id
+    ):
+        self._store.clear_manual_selection(
+            platform=platform, chat_id=chat_id,
+            telegram_user_id=telegram_user_id, transaction_id=transaction_id,
         )
 
     def acquire_initial_prompt_delivery(

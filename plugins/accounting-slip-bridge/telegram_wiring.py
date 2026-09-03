@@ -16,7 +16,7 @@ import uuid
 CALLBACK_PREFIX = "lk"
 CALLBACK_LIMIT_BYTES = 64
 _PAYLOAD_RE = re.compile(
-    r"^lk:([0-9a-f]{32}):([0-9a-z]+):(p|np|mp|us|in|ex|ma|la|tr|co|ot|iw|ar|mc|bk|ca|cf|rt)(?::([0-9a-f]{12}))?$"
+    r"^lk:([0-9a-f]{32}):([0-9a-z]+):(p|np|mp|us|in|ex|ma|la|tr|co|ot|iw|ar|mc|bk|ca|cf|rt|ms)(?::([0-9a-f]{12}))?$"
 )
 
 ACTION_CODES = {
@@ -37,6 +37,7 @@ ACTION_CODES = {
     "cancel": "ca",
     "confirm": "cf",
     "retry": "rt",
+    "select_manual": "ms",
 }
 CODE_ACTIONS = {value: key for key, value in ACTION_CODES.items()}
 
@@ -173,6 +174,13 @@ class TelegramTransactionController:
         actor = self._actor(platform, chat_id, telegram_user_id)
         try:
             record = self._flow.get_transaction(identity.transaction_id, **actor)
+            if identity.action == "select_manual":
+                self._flow.select_manual_pending(
+                    identity.transaction_id,
+                    expected_version=identity.expected_version,
+                    **actor,
+                )
+                return self._success(identity.transaction_id, actor)
             if identity.action == "confirm":
                 return self._handle_confirm(record, identity, actor)
             if identity.action == "retry":
@@ -219,15 +227,23 @@ class TelegramTransactionController:
     ):
         actor = self._actor(platform, chat_id, telegram_user_id)
         try:
-            self._flow.submit_manual(
+            updated = self._flow.submit_manual(
                 transaction_id,
                 expected_version=expected_version,
                 value=text,
                 **actor,
             )
+            self._flow.clear_manual_selection(transaction_id, **actor)
+            if updated["current_state"] in {
+                "confirmed_intent", "drive_pending", "drive_uploaded",
+                "sheets_pending",
+            }:
+                return self._run_save(transaction_id, actor)
             return self._success(transaction_id, actor)
         except Exception as exc:
-            return self._flow_error(exc)
+            result = self._flow_error(exc)
+            result["prompt"] = self._manual_error_prompt(result)
+            return result
 
     def handle_manual_message(
         self, text, *, platform, chat_id, telegram_user_id
@@ -236,6 +252,8 @@ class TelegramTransactionController:
         try:
             record = self._flow.get_manual_pending(**actor)
         except Exception as exc:
+            if exc.__class__.__name__ == "MultipleManualPendingError":
+                return self._manual_selection_required(exc.records)
             return self._flow_error(exc)
         if record is None:
             return None
@@ -245,6 +263,43 @@ class TelegramTransactionController:
             text,
             **actor,
         )
+
+    def _manual_selection_required(self, records):
+        buttons = []
+        for record in records:
+            reference = str(record.get("reference_no") or "").strip()
+            label = reference or f"รายการ {record['transaction_id'][:8]}"
+            buttons.append({
+                "label": label,
+                "callback_data": encode_callback(
+                    record["transaction_id"], record["version"], "select_manual"
+                ),
+            })
+        return {
+            "ok": False,
+            "error_code": "manual_selection_required",
+            "prompt": {
+                "text": "มีหลายรายการที่รอข้อมูล กรุณาเลือกรายการก่อน",
+                "buttons": buttons,
+                "manual_input_required": False,
+            },
+        }
+
+    @staticmethod
+    def _manual_error_prompt(result):
+        messages = {
+            "validation_error": "ข้อมูลไม่ถูกต้อง กรุณากรอกใหม่",
+            "stale_callback": "รายการนี้เปลี่ยนแปลงแล้ว กรุณาเลือกรายการใหม่",
+            "unauthorized": "คุณไม่มีสิทธิ์แก้ไขรายการนี้",
+            "invalid_transition": "รายการนี้ไม่รอรับข้อมูลแล้ว",
+        }
+        return {
+            "text": messages.get(result.get("error_code"))
+            or result.get("message")
+            or "ไม่สามารถรับข้อมูลนี้ได้ กรุณาลองใหม่",
+            "buttons": [],
+            "manual_input_required": True,
+        }
 
     def render(self, transaction_id, *, platform, chat_id, telegram_user_id):
         actor = self._actor(platform, chat_id, telegram_user_id)

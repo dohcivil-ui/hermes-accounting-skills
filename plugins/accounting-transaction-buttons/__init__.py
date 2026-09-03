@@ -231,13 +231,16 @@ def _patch_module(mod_name, *, strict=False):
                     bool(result and result.get("prompt")),
                 )
                 if result is not None:
-                    if result.get("prompt"):
-                        reply = getattr(message, "reply_text", None)
-                        if reply is not None:
-                            await reply(
-                                result["prompt"]["text"],
-                                reply_markup=_rows(mod, result["prompt"]),
-                            )
+                    response = result.get("prompt") or {
+                        "text": result.get("message") or "ไม่สามารถรับข้อมูลนี้ได้ กรุณาลองใหม่",
+                        "buttons": [],
+                    }
+                    reply = getattr(message, "reply_text", None)
+                    if reply is not None:
+                        await reply(
+                            response["text"],
+                            reply_markup=_rows(mod, response),
+                        )
                     _LOG.info("Lekza text fallback original=false")
                     return
             except Exception as exc:

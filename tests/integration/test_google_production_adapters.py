@@ -1,4 +1,5 @@
 import importlib.util
+import json
 from pathlib import Path
 import tempfile
 import threading
@@ -564,6 +565,54 @@ class SavePipelineRestartTests(unittest.TestCase):
         self.assertEqual(self.drive_session.uploads, 1)
         self.assertEqual(self.sheets_session.batch_calls, 1)
         store.close()
+
+    def test_legacy_sheets_pending_amount_recovery_skips_drive_and_appends_once(self):
+        setup_store, setup_flow = self.open_flow()
+        pending = self.prepare_sheets_pending(
+            setup_flow, "SYNTHETIC-LEGACY-AMOUNT", "drive-id-legacy-amount"
+        )
+        fields = dict(setup_flow.get_transaction(
+            pending["transaction_id"], **self.actor
+        )["ocr_fields"])
+        fields.pop("amount")
+        setup_store.transition(
+            pending["transaction_id"], expected_version=pending["version"],
+            allowed_from={"sheets_pending"},
+            changes={
+                "ocr_fields_json": json.dumps(fields),
+                "needs_amount": 1,
+                "entry_mode": "amount",
+            },
+            **self.actor,
+        )
+        setup_store.close()
+
+        store, flow = self.open_flow()
+        try:
+            selected = flow.get_manual_pending(**self.actor)
+            recovered = flow.submit_manual(
+                selected["transaction_id"], expected_version=selected["version"],
+                value="42.75", **self.actor,
+            )
+            self.assertEqual(recovered["current_state"], "sheets_pending")
+            pipeline = self.adapters.ProductionSavePipeline(
+                flow,
+                self.adapters.GoogleDriveAdapter(
+                    "folder-1", lambda: "token", session=self.drive_session
+                ),
+                self.adapters.GoogleSheetsAdapter(
+                    "sheet-1", lambda: "token", session=self.sheets_session
+                ),
+            )
+            first = pipeline.save(pending["transaction_id"], **self.actor)
+            duplicate = pipeline.save(pending["transaction_id"], **self.actor)
+            self.assertEqual(first["current_state"], "confirmed")
+            self.assertEqual(duplicate["current_state"], "confirmed")
+            self.assertEqual(self.drive_session.uploads, 0)
+            self.assertEqual(self.sheets_session.batch_calls, 1)
+            self.assertEqual(len(self.sheets_session.rows), 2)
+        finally:
+            store.close()
 
     def test_two_concurrent_save_workers_produce_exactly_one_sheets_row(self):
         setup_store, setup_flow = self.open_flow()
