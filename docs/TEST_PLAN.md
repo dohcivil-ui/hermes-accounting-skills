@@ -38,6 +38,23 @@ Baseline tests remain required. Add the following acceptance gates as their road
 - AI Audit safety: AI may suggest classifications or anomalies but must not invent accounting values or bypass human confirmation.
 - Cost Meter: validate OCR requests/credits, AI tokens, cost per slip, cost per Job, and monthly totals.
 
+## Scheduled reporting acceptance
+
+Synthetic unit and integration tests cover Bangkok calendar boundaries, daily
+and rolling seven-day weekly periods, Sunday and month-end gates including leap
+years, confirmed-only aggregation, zero-activity projects, totals and counts,
+weekly top payees, monthly category/payee breakdowns, deterministic Telegram
+chunking, UTF-8 HTML, embedded Thai-font PDF generation, read-only frozen-schema
+Sheets access, and durable suppression of duplicate messages and attachments
+across retries and process restarts. These tests perform no live network calls
+and do not invoke the Phase D staging smoke procedure.
+
+Runtime-path regressions reject the repository/runtime source root and every
+descendant for ledger, archive, and font configuration while accepting absolute
+external paths. Reporting accepts only known transaction statuses: `confirmed`
+is aggregated, `deleted` is skipped, and empty, malformed, or unknown values
+fail closed.
+
 ## Phase A durable-state acceptance
 
 The deterministic SQLite integration harness covers:

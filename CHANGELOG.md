@@ -15,9 +15,15 @@ Previous stable release: `v0.1.0`.
 - Staging isolation guard, post-interaction verifier, and opt-in disposable
   Google integration test
 - Production dependency pins in `requirements.txt`
+- Scheduled daily, rolling seven-day weekly, and month-end project reporting
+  with Telegram summaries, UTF-8 HTML attachments, archived Thai-font PDFs,
+  and durable per-chunk/per-attachment delivery suppression
 
 ### Fixed
 
+- Reject scheduled-report ledger, archive, and font paths anywhere inside the
+  resolved repository/runtime source tree, and fail closed on unknown
+  transaction statuses while preserving known soft-delete filtering
 - Hermes skill metadata compatibility while preserving the production
   `/data/skills/accounting` runtime path
 - Enum-keyed Telegram adapter lookup and durable handling of remote Telegram
@@ -32,10 +38,15 @@ Previous stable release: `v0.1.0`.
   one or more absolute `LEKZA_ALLOWED_UPLOAD_ROOTS` paths.
 - Google Sheets headers must exactly match the frozen schemas in
   `docs/ARCHITECTURE.md`; incompatible schemas fail closed.
+- Scheduled reporting requires external absolute ledger/archive/font paths and
+  an environment-configured Telegram destination. Cron remains disabled until
+  a separately approved production deployment.
 
 ### Verification
 
-- Local baseline: `94 passed / 1 skipped`; zero failures and zero errors.
+- Focused scheduled-reporting tests: `30 passed`; zero failures and zero errors.
+- Full synthetic suite excluding the prohibited Phase D smoke module:
+  `175 passed / 1 skipped`; zero failures and zero errors.
 - Intentionally skipped test:
   `live.test_google_adapters_live.GoogleAdaptersLiveSmokeTests.test_confirmed_transaction_reaches_designated_test_drive_and_sheet`.
   It requires explicitly acknowledged disposable Google resources and remains
@@ -53,6 +64,9 @@ Previous stable release: `v0.1.0`.
   duplicate prompt; transaction callbacks and external writes remain durable.
 - Google credentials and designated resource IDs must be provisioned in the
   runtime environment; they are not stored in this repository.
+- Telegram Bot API has no server-side idempotency key. To prevent duplicates,
+  a scheduled delivery interrupted after its external call starts remains in
+  `delivering` and requires operator reconciliation instead of automatic replay.
 
 ### Rollback
 

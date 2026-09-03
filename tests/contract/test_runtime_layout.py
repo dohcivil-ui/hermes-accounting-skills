@@ -16,6 +16,8 @@ class RuntimeLayoutTests(unittest.TestCase):
             "skills/accounting/process-slip-pipeline/scripts/process_slip.py",
             "skills/accounting/query-payee-summary/SKILL.md",
             "skills/accounting/scheduled-project-report/SKILL.md",
+            "skills/accounting/scheduled-project-report/scripts/run_report.py",
+            "skills/accounting/scheduled-project-report/scripts/scheduled_reporting.py",
             "plugins/accounting-slip-bridge/__init__.py",
             "plugins/accounting-slip-bridge/transaction_flow.py",
             "plugins/accounting-slip-bridge/telegram_wiring.py",
