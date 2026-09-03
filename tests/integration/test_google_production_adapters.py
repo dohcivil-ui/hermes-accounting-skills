@@ -1,7 +1,9 @@
 import importlib.util
+import json
 from pathlib import Path
 import tempfile
 import threading
+import traceback
 import unittest
 import uuid
 
@@ -181,6 +183,221 @@ class AdapterTests(unittest.TestCase):
             "last_actions", "created_at", "updated_at",
         ))
 
+    def test_oauth_refresh_success_is_cached(self):
+        class TokenSession:
+            def __init__(self):
+                self.calls = 0
+            def post(inner_self, url, **kwargs):
+                inner_self.calls += 1
+                self.assertEqual(kwargs["timeout"], 3)
+                return FakeResponse(200, {"access_token": "fresh-token", "expires_in": 3600})
+        session = TokenSession()
+        provider = self.adapters.RefreshingTokenProvider(
+            "client", "secret", "refresh", session=session, timeout=3
+        )
+        self.assertEqual(provider(), "fresh-token")
+        self.assertEqual(provider(), "fresh-token")
+        self.assertEqual(session.calls, 1)
+
+    def test_concurrent_token_requests_share_one_refresh(self):
+        class TokenSession:
+            def __init__(self):
+                self.calls = 0
+            def post(self, url, **kwargs):
+                self.calls += 1
+                return FakeResponse(200, {"access_token": "shared-token", "expires_in": 3600})
+        session = TokenSession()
+        provider = self.adapters.RefreshingTokenProvider(
+            "client", "secret", "refresh", session=session
+        )
+        start = threading.Barrier(9)
+        tokens = []
+        errors = []
+
+        def worker():
+            start.wait(timeout=5)
+            try:
+                tokens.append(provider())
+            except Exception as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=worker) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        start.wait(timeout=5)
+        for thread in threads:
+            thread.join(timeout=5)
+        self.assertEqual(errors, [])
+        self.assertEqual(tokens, ["shared-token"] * 8)
+        self.assertEqual(session.calls, 1)
+
+    def test_partial_oauth_environment_fails_closed_even_with_legacy_token(self):
+        environment = {
+            self.adapters.CLIENT_ID_ENV: "client",
+            self.adapters.ACCESS_TOKEN_ENV: "legacy-token",
+        }
+        with self.assertRaisesRegex(ValueError, "incomplete"):
+            self.adapters.RefreshingTokenProvider.from_environment(environment)
+
+    def test_oauth_refresh_failure_and_timeout_fail_closed_without_secret_leakage(self):
+        secret = "synthetic-client-secret"
+        class FailedSession:
+            def post(self, url, **kwargs):
+                raise TimeoutError(secret)
+        provider = self.adapters.RefreshingTokenProvider(
+            "client", secret, "refresh", session=FailedSession(), timeout=0.01
+        )
+        with self.assertRaises(self.adapters.GoogleAdapterError) as caught:
+            provider()
+        self.assertNotIn(secret, str(caught.exception))
+        self.assertNotIn(secret, repr(caught.exception))
+        rendered = "".join(traceback.format_exception(caught.exception))
+        self.assertNotIn(secret, rendered)
+
+        class RejectedSession:
+            def post(self, url, **kwargs):
+                return FakeResponse(400, {"error": "invalid_grant"})
+        rejected = self.adapters.RefreshingTokenProvider(
+            "client", secret, "refresh", session=RejectedSession()
+        )
+        with self.assertRaises(self.adapters.GoogleAdapterError) as rejected_error:
+            rejected()
+        self.assertNotIn(secret, str(rejected_error.exception))
+
+    def test_legacy_access_token_remains_supported(self):
+        provider = self.adapters.RefreshingTokenProvider.from_environment(
+            {self.adapters.ACCESS_TOKEN_ENV: "legacy-token"}
+        )
+        self.assertEqual(provider(), "legacy-token")
+
+    def test_401_forces_one_refresh_and_retries(self):
+        class Provider:
+            def __init__(self):
+                self.token = "old"
+                self.refreshes = 0
+            def __call__(self):
+                return self.token
+            def refresh(self):
+                self.refreshes += 1
+                self.token = "new"
+                return self.token
+        class Session:
+            def __init__(self):
+                self.calls = []
+            def get(self, url, **kwargs):
+                self.calls.append(kwargs["headers"]["Authorization"])
+                if len(self.calls) == 1:
+                    return FakeResponse(401, {})
+                return FakeResponse(200, {"ids": ["reserved-1"]})
+        provider, session = Provider(), Session()
+        adapter = self.adapters.GoogleDriveAdapter(
+            "folder-1", provider, session=session
+        )
+        self.assertEqual(adapter.reserve_file_id(), "reserved-1")
+        self.assertEqual(provider.refreshes, 1)
+        self.assertEqual(session.calls, ["Bearer old", "Bearer new"])
+
+    def test_concurrent_401_responses_trigger_one_conditional_refresh(self):
+        class TokenSession:
+            def __init__(self):
+                self.calls = 0
+            def post(self, url, **kwargs):
+                self.calls += 1
+                token = "old-token" if self.calls == 1 else "new-token"
+                return FakeResponse(200, {"access_token": token, "expires_in": 3600})
+        token_session = TokenSession()
+        provider = self.adapters.RefreshingTokenProvider(
+            "client", "secret", "refresh", session=token_session
+        )
+        self.assertEqual(provider(), "old-token")
+        barrier = threading.Barrier(2)
+
+        class ApiSession:
+            def get(self, url, **kwargs):
+                token = kwargs["headers"]["Authorization"]
+                if token == "Bearer old-token":
+                    barrier.wait(timeout=5)
+                    return FakeResponse(401, {})
+                return FakeResponse(200, {"ids": ["reserved-1"]})
+        adapter = self.adapters.GoogleDriveAdapter(
+            "folder-1", provider, session=ApiSession()
+        )
+        results = []
+        threads = [threading.Thread(target=lambda: results.append(adapter.reserve_file_id())) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=5)
+            self.assertFalse(thread.is_alive())
+        self.assertEqual(results, ["reserved-1"] * 2)
+        self.assertEqual(token_session.calls, 2)
+
+    def test_drive_upload_401_has_one_successful_side_effect(self):
+        class Provider:
+            def __init__(self):
+                self.token = "old"
+            def __call__(self):
+                return self.token
+            def refresh(self):
+                self.token = "new"
+        provider = Provider()
+
+        class Session:
+            def __init__(self):
+                self.post_attempts = 0
+                self.uploads = 0
+            def get(self, url, **kwargs):
+                return FakeResponse(404, {})
+            def post(self, url, **kwargs):
+                self.post_attempts += 1
+                if kwargs["headers"]["Authorization"] == "Bearer old":
+                    return FakeResponse(401, {})
+                self.uploads += 1
+                return FakeResponse(200, {
+                    "id": "reserved-1", "webViewLink": "https://drive.google.test/reserved-1",
+                    "appProperties": {"lekza_transaction_id": self_transaction_id},
+                    "parents": ["folder-1"],
+                })
+        self_transaction_id = self.transaction_id
+        session = Session()
+        adapter = self.adapters.GoogleDriveAdapter(
+            "folder-1", provider, session=session
+        )
+        adapter.upload(self.transaction_id, self.slip, "reserved-1")
+        self.assertEqual(session.post_attempts, 2)
+        self.assertEqual(session.uploads, 1)
+
+    def test_sheets_append_401_has_one_successful_side_effect(self):
+        class Provider:
+            def __init__(self):
+                self.token = "old"
+            def __call__(self):
+                return self.token
+            def refresh(self):
+                self.token = "new"
+        provider = Provider()
+
+        class RetrySheetsSession(SheetsSession):
+            def __init__(self, module):
+                super().__init__(module)
+                self.post_attempts = 0
+            def post(self, url, **kwargs):
+                self.post_attempts += 1
+                if kwargs["headers"]["Authorization"] == "Bearer old":
+                    return FakeResponse(401, {})
+                return super().post(url, **kwargs)
+        session = RetrySheetsSession(self.adapters)
+        adapter = self.adapters.GoogleSheetsAdapter(
+            "sheet-1", provider, session=session
+        )
+        self.assertEqual(
+            adapter.append_transaction(self.transaction(), write_claim=self.claim()),
+            "Transactions!A2:R2",
+        )
+        self.assertEqual(session.post_attempts, 2)
+        self.assertEqual(session.batch_calls, 1)
+        self.assertEqual(len(session.rows), 2)
+
     def test_drive_normal_upload_returns_identity_and_link(self):
         session = DriveSession()
         adapter = self.adapters.GoogleDriveAdapter("folder-1", lambda: "token", session=session)
@@ -348,6 +565,54 @@ class SavePipelineRestartTests(unittest.TestCase):
         self.assertEqual(self.drive_session.uploads, 1)
         self.assertEqual(self.sheets_session.batch_calls, 1)
         store.close()
+
+    def test_legacy_sheets_pending_amount_recovery_skips_drive_and_appends_once(self):
+        setup_store, setup_flow = self.open_flow()
+        pending = self.prepare_sheets_pending(
+            setup_flow, "SYNTHETIC-LEGACY-AMOUNT", "drive-id-legacy-amount"
+        )
+        fields = dict(setup_flow.get_transaction(
+            pending["transaction_id"], **self.actor
+        )["ocr_fields"])
+        fields.pop("amount")
+        setup_store.transition(
+            pending["transaction_id"], expected_version=pending["version"],
+            allowed_from={"sheets_pending"},
+            changes={
+                "ocr_fields_json": json.dumps(fields),
+                "needs_amount": 1,
+                "entry_mode": "amount",
+            },
+            **self.actor,
+        )
+        setup_store.close()
+
+        store, flow = self.open_flow()
+        try:
+            selected = flow.get_manual_pending(**self.actor)
+            recovered = flow.submit_manual(
+                selected["transaction_id"], expected_version=selected["version"],
+                value="42.75", **self.actor,
+            )
+            self.assertEqual(recovered["current_state"], "sheets_pending")
+            pipeline = self.adapters.ProductionSavePipeline(
+                flow,
+                self.adapters.GoogleDriveAdapter(
+                    "folder-1", lambda: "token", session=self.drive_session
+                ),
+                self.adapters.GoogleSheetsAdapter(
+                    "sheet-1", lambda: "token", session=self.sheets_session
+                ),
+            )
+            first = pipeline.save(pending["transaction_id"], **self.actor)
+            duplicate = pipeline.save(pending["transaction_id"], **self.actor)
+            self.assertEqual(first["current_state"], "confirmed")
+            self.assertEqual(duplicate["current_state"], "confirmed")
+            self.assertEqual(self.drive_session.uploads, 0)
+            self.assertEqual(self.sheets_session.batch_calls, 1)
+            self.assertEqual(len(self.sheets_session.rows), 2)
+        finally:
+            store.close()
 
     def test_two_concurrent_save_workers_produce_exactly_one_sheets_row(self):
         setup_store, setup_flow = self.open_flow()

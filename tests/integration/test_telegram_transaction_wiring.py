@@ -1,5 +1,6 @@
 import asyncio
 import importlib.util
+import json
 import os
 from pathlib import Path
 import sys
@@ -134,6 +135,39 @@ class TelegramTransactionWiringTests(unittest.TestCase):
         prompt = self.click(prompt, "expense")["prompt"]
         return self.click(prompt, "materials")["prompt"]
 
+    def make_failed_missing_amount(self):
+        review = self.advance_to_review()
+        intent = self.flow.confirm(
+            self.record["transaction_id"],
+            expected_version=review["version"],
+            **self.actor,
+        )
+        drive_pending = self.flow.mark_drive_pending(
+            intent["transaction_id"],
+            expected_version=intent["version"],
+            **self.actor,
+        )
+        failed = self.flow.mark_failed(
+            drive_pending["transaction_id"],
+            expected_version=drive_pending["version"],
+            error_code="DRIVE_TRANSIENT",
+            **self.actor,
+        )
+        failed = self.flow.get_transaction(failed["transaction_id"], **self.actor)
+        fields = dict(failed["ocr_fields"])
+        fields.pop("amount")
+        return self.store.transition(
+            failed["transaction_id"],
+            expected_version=failed["version"],
+            allowed_from={"failed"},
+            changes={
+                "ocr_fields_json": json.dumps(fields),
+                "needs_amount": 1,
+                "entry_mode": "amount",
+            },
+            **self.actor,
+        )
+
     def expire_prompt_lease(self, transaction_id):
         with self.store._connection:
             self.store._connection.execute(
@@ -169,6 +203,257 @@ class TelegramTransactionWiringTests(unittest.TestCase):
         self.assertEqual(durable["selected_user_id"], "2002")
         self.assertEqual(durable["transaction_type"], "expense")
         self.assertEqual(durable["category"], "materials")
+
+    def test_missing_amount_prompts_for_manual_value_before_any_save(self):
+        record = self.flow.begin(
+            tenant_id="tenant-test", platform="telegram", chat_id="1001",
+            thread_id=None, session_id="missing-amount", telegram_user_id="2002",
+            source_image_path=self.slip,
+            ocr_result={"parsed": {"reference_no": "PHASE-C-NO-AMOUNT", "amount": None}},
+        )
+        prompt = self.controller.render(record["transaction_id"], **self.actor)
+        self.assertTrue(prompt["manual_input_required"])
+        self.assertIn("ยอดเงิน", prompt["text"])
+        self.assertEqual(self.pipeline.calls, 0)
+
+        invalid = self.controller.handle_manual_message("not-a-number", **self.actor)
+        self.assertEqual(invalid["error_code"], "validation_error")
+        self.assertIsNotNone(invalid["prompt"])
+        self.assertNotIn(invalid["error_code"], {"DRIVE_TRANSIENT", "SHEETS_TRANSIENT"})
+        self.assertEqual(self.pipeline.calls, 0)
+
+        valid = self.controller.handle_manual_message("250.75", **self.actor)
+        self.assertTrue(valid["ok"])
+        self.assertEqual(valid["prompt"]["current_state"], "waiting_project")
+        self.assertEqual(self.pipeline.calls, 0)
+
+    def test_multiple_manual_pending_requires_identity_selection_without_mutation(self):
+        records = []
+        for index in range(2):
+            records.append(self.flow.begin(
+                tenant_id="tenant-test", platform="telegram", chat_id="1001",
+                thread_id=None, session_id=f"multiple-{index}", telegram_user_id="2002",
+                source_image_path=self.slip,
+                ocr_result={"parsed": {
+                    "reference_no": f"MULTIPLE-{index}", "amount": None,
+                }},
+            ))
+        before = [
+            self.flow.get_transaction(item["transaction_id"], **self.actor)
+            for item in records
+        ]
+
+        result = self.controller.handle_manual_message("100.25", **self.actor)
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error_code"], "manual_selection_required")
+        identities = [
+            self.wiring.decode_callback(button["callback_data"])
+            for button in result["prompt"]["buttons"]
+        ]
+        self.assertEqual({item.action for item in identities}, {"select_manual"})
+        self.assertEqual(
+            {item.transaction_id for item in identities},
+            {item["transaction_id"] for item in records},
+        )
+        after = [
+            self.flow.get_transaction(item["transaction_id"], **self.actor)
+            for item in records
+        ]
+        self.assertEqual(before, after)
+
+    def test_selected_manual_transaction_survives_restart_and_receives_amount_only(self):
+        records = [self.flow.begin(
+            tenant_id="tenant-test", platform="telegram", chat_id="1001",
+            thread_id=None, session_id=f"selected-{index}", telegram_user_id="2002",
+            source_image_path=self.slip,
+            ocr_result={"parsed": {"reference_no": f"SELECTED-{index}", "amount": None}},
+        ) for index in range(2)]
+        selection = self.controller.handle_manual_message("ignored", **self.actor)["prompt"]
+        target = records[1]
+        button = next(
+            item for item in selection["buttons"]
+            if self.wiring.decode_callback(item["callback_data"]).transaction_id
+            == target["transaction_id"]
+        )
+        chosen = self.controller.handle_callback(button["callback_data"], **self.actor)
+        self.assertTrue(chosen["ok"])
+
+        restarted_store = self.flow_module.SQLiteStateStore(self.db_path)
+        try:
+            restarted_flow = self.flow_module.TransactionFlow(
+                restarted_store, allowed_source_roots=[self.uploads],
+                projects=["Project A", "Project B"],
+            )
+            restarted = self.wiring.TelegramTransactionController(
+                restarted_flow, FakeSavePipeline(restarted_flow),
+                projects=["Project A", "Project B"],
+            )
+            submitted = restarted.handle_manual_message("345.67", **self.actor)
+            self.assertTrue(submitted["ok"])
+            selected = restarted_flow.get_transaction(target["transaction_id"], **self.actor)
+            other = restarted_flow.get_transaction(records[0]["transaction_id"], **self.actor)
+            self.assertEqual(selected["ocr_fields"]["amount"], 345.67)
+            self.assertFalse(selected["needs_amount"])
+            self.assertTrue(other["needs_amount"])
+        finally:
+            restarted_store.close()
+
+    def test_manual_selection_rejects_stale_version_and_wrong_actor(self):
+        records = [self.flow.begin(
+            tenant_id="tenant-test", platform="telegram", chat_id="1001",
+            thread_id=None, session_id=f"guard-{index}", telegram_user_id="2002",
+            source_image_path=self.slip,
+            ocr_result={"parsed": {"reference_no": f"GUARD-{index}", "amount": None}},
+        ) for index in range(2)]
+        prompt = self.controller.handle_manual_message("ignored", **self.actor)["prompt"]
+        payload = next(
+            item["callback_data"] for item in prompt["buttons"]
+            if self.wiring.decode_callback(item["callback_data"]).transaction_id
+            == records[0]["transaction_id"]
+        )
+        wrong = self.controller.handle_callback(
+            payload, platform="telegram", chat_id="1001", telegram_user_id="wrong"
+        )
+        self.assertEqual(wrong["error_code"], "unauthorized")
+        selected = self.controller.handle_callback(payload, **self.actor)
+        self.assertTrue(selected["ok"])
+        self.flow.cancel(
+            records[0]["transaction_id"], expected_version=records[0]["version"], **self.actor
+        )
+        stale_text = self.controller.handle_manual_message("100", **self.actor)
+        self.assertEqual(stale_text["error_code"], "stale_callback")
+        stale = self.controller.handle_callback(payload, **self.actor)
+        self.assertEqual(stale["error_code"], "stale_callback")
+        untouched = self.flow.get_transaction(records[1]["transaction_id"], **self.actor)
+        self.assertTrue(untouched["needs_amount"])
+
+    def test_save_validation_error_is_not_classified_as_external_transient(self):
+        class ValidationPipeline:
+            def save(self, transaction_id, **actor):
+                raise ValueError("Transaction amount must be valid")
+
+        controller = self.wiring.TelegramTransactionController(
+            self.flow, ValidationPipeline(), projects=["Project A", "Project B"]
+        )
+        review = self.advance_to_review()
+        result = controller.handle_callback(
+            self.callback(review, "confirm"), **self.actor
+        )
+        durable = self.flow.get_transaction(self.record["transaction_id"], **self.actor)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error_code"], "validation_error")
+        self.assertIsNone(durable["last_error_code"])
+        self.assertEqual(durable["current_state"], "confirmed_intent")
+
+    def test_legacy_sheets_pending_manual_amount_resumes_without_drive_rewind(self):
+        review = self.advance_to_review()
+        intent = self.flow.confirm(
+            self.record["transaction_id"], expected_version=review["version"], **self.actor
+        )
+        drive_pending = self.flow.mark_drive_pending(
+            intent["transaction_id"], expected_version=intent["version"], **self.actor
+        )
+        reserved = self.flow.reserve_drive_upload(
+            drive_pending["transaction_id"], expected_version=drive_pending["version"],
+            file_id="legacy-drive-id", **self.actor
+        )
+        uploaded = self.flow.mark_drive_uploaded(
+            reserved["transaction_id"], expected_version=reserved["version"],
+            file_id="legacy-drive-id", web_view_link="https://drive.test/legacy-drive-id",
+            **self.actor
+        )
+        sheets_pending = self.flow.mark_sheets_pending(
+            uploaded["transaction_id"], expected_version=uploaded["version"], **self.actor
+        )
+        fields = dict(self.flow.get_transaction(
+            sheets_pending["transaction_id"], **self.actor
+        )["ocr_fields"])
+        fields.pop("amount")
+        legacy = self.store.transition(
+            sheets_pending["transaction_id"], expected_version=sheets_pending["version"],
+            allowed_from={"sheets_pending"},
+            changes={
+                "ocr_fields_json": json.dumps(fields),
+                "needs_amount": 1,
+                "entry_mode": "amount",
+            },
+            **self.actor,
+        )
+
+        result = self.controller.handle_manual_message("88.25", **self.actor)
+
+        durable = self.flow.get_transaction(legacy["transaction_id"], **self.actor)
+        self.assertTrue(result["ok"])
+        self.assertEqual(durable["current_state"], "confirmed")
+        self.assertEqual(durable["drive_file_id"], "legacy-drive-id")
+        self.assertEqual(self.pipeline.calls, 1)
+
+    def test_failed_missing_amount_is_routable_and_retry_resumes_save(self):
+        legacy = self.make_failed_missing_amount()
+
+        pending = self.flow.get_manual_pending(**self.actor)
+        self.assertEqual(pending["transaction_id"], legacy["transaction_id"])
+        submitted = self.controller.handle_manual_message("1,250.75", **self.actor)
+        after_amount = self.flow.get_transaction(legacy["transaction_id"], **self.actor)
+
+        self.assertTrue(submitted["ok"])
+        self.assertEqual(submitted["prompt"]["current_state"], "failed")
+        self.assertEqual(
+            self.wiring.decode_callback(
+                submitted["prompt"]["buttons"][0]["callback_data"]
+            ).action,
+            "retry",
+        )
+        self.assertEqual(after_amount["ocr_fields"]["amount"], 1250.75)
+        self.assertFalse(after_amount["needs_amount"])
+        self.assertIsNone(after_amount["entry_mode"])
+        self.assertEqual(after_amount["current_state"], "failed")
+        self.assertEqual(after_amount["retry_state"], "drive_pending")
+        self.assertEqual(after_amount["last_error_code"], "DRIVE_TRANSIENT")
+        self.assertEqual(after_amount["retry_count"], legacy["retry_count"])
+        self.assertEqual(self.pipeline.calls, 0)
+
+        retry_payload = self.callback(submitted["prompt"], "retry")
+        retried = self.controller.handle_callback(retry_payload, **self.actor)
+        duplicate = self.controller.handle_callback(retry_payload, **self.actor)
+        durable = self.flow.get_transaction(legacy["transaction_id"], **self.actor)
+
+        self.assertEqual(retried["prompt"]["current_state"], "confirmed")
+        self.assertEqual(duplicate["error_code"], "stale_callback")
+        self.assertEqual(durable["current_state"], "confirmed")
+        self.assertEqual(self.pipeline.calls, 1)
+
+    def test_multiple_manual_pending_can_select_failed_amount_without_mutation(self):
+        failed = self.make_failed_missing_amount()
+        other = self.flow.begin(
+            tenant_id="tenant-test", platform="telegram", chat_id="1001",
+            thread_id=None, session_id="failed-multiple", telegram_user_id="2002",
+            source_image_path=self.slip,
+            ocr_result={"parsed": {
+                "reference_no": "FAILED-MULTIPLE-OTHER", "amount": None,
+            }},
+        )
+        before_other = self.flow.get_transaction(other["transaction_id"], **self.actor)
+
+        selection = self.controller.handle_manual_message("ignored", **self.actor)
+        self.assertEqual(selection["error_code"], "manual_selection_required")
+        failed_payload = next(
+            item["callback_data"] for item in selection["prompt"]["buttons"]
+            if self.wiring.decode_callback(item["callback_data"]).transaction_id
+            == failed["transaction_id"]
+        )
+        selected = self.controller.handle_callback(failed_payload, **self.actor)
+        submitted = self.controller.handle_manual_message("99.50", **self.actor)
+
+        self.assertTrue(selected["ok"])
+        self.assertTrue(submitted["ok"])
+        self.assertEqual(submitted["prompt"]["current_state"], "failed")
+        self.assertEqual(
+            self.flow.get_transaction(other["transaction_id"], **self.actor),
+            before_other,
+        )
+        self.assertEqual(self.pipeline.calls, 0)
 
     def test_back_and_cancel_use_durable_state(self):
         prompt = self.controller.render(self.record["transaction_id"], **self.actor)
@@ -541,6 +826,19 @@ class TelegramTransactionWiringTests(unittest.TestCase):
             self.assertNotIn(Message.text, failure_logs)
             self.assertNotIn("1001", failure_logs)
             self.assertNotIn("2002", failure_logs)
+
+            with patch.dict(
+                os.environ, {"LEKZA_RUNTIME_ENV": "production"}
+            ), patch.object(
+                self.controller,
+                "handle_manual_message",
+                return_value={
+                    "ok": False,
+                    "error_code": "validation_error",
+                    "message": "กรุณากรอกยอดใหม่",
+                },
+            ):
+                asyncio.run(adapter._handle_text_message(update, None))
         finally:
             sys.modules.pop(fake_name, None)
 
@@ -548,7 +846,8 @@ class TelegramTransactionWiringTests(unittest.TestCase):
         self.assertEqual(original_calls, ["text"])
         self.assertEqual(durable["reference_no"], "MANUAL-REFERENCE-001")
         self.assertFalse(durable["needs_reference"])
-        self.assertEqual(len(replies), 1)
+        self.assertEqual(len(replies), 2)
+        self.assertEqual(replies[-1][0], "กรุณากรอกยอดใหม่")
 
     def test_runtime_patch_rebinds_already_registered_text_handler(self):
         pending = self.controller.begin_from_ocr(
@@ -678,7 +977,9 @@ class TelegramTransactionWiringTests(unittest.TestCase):
         try:
             with self.assertLogs(
                 "lekza.accounting_transaction_buttons", level="INFO"
-            ) as captured:
+            ) as captured, patch.object(
+                plugin, "_start_registered_handler_watch", return_value=None
+            ):
                 plugin.register(Context())
             self.assertIn(
                 "registered handler rebind text=1 callback=1",

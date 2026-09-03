@@ -11,6 +11,7 @@ import json
 import mimetypes
 import os
 from pathlib import Path
+import threading
 import time
 import urllib.parse
 import uuid
@@ -24,6 +25,10 @@ except ImportError:  # The production runtime supplies requests; tests inject a 
 SLIP_FOLDER_ENV = "LEKZA_SLIP_FOLDER_ID"
 SPREADSHEET_ENV = "LEKZA_ACCOUNTING_SPREADSHEET_ID"
 ACCESS_TOKEN_ENV = "LEKZA_GOOGLE_ACCESS_TOKEN"
+CLIENT_ID_ENV = "LEKZA_GOOGLE_CLIENT_ID"
+CLIENT_SECRET_ENV = "LEKZA_GOOGLE_CLIENT_SECRET"
+REFRESH_TOKEN_ENV = "LEKZA_GOOGLE_REFRESH_TOKEN"
+TOKEN_URL = "https://oauth2.googleapis.com/token"
 
 TRANSACTIONS_SCHEMA = (
     "transaction_id", "reference_no", "date", "payer", "payee",
@@ -89,6 +94,89 @@ class BearerTokenProvider:
     def __call__(self):
         return self._token
 
+    def refresh(self):
+        return self._token
+
+
+class RefreshingTokenProvider:
+    """Cached OAuth access tokens from a long-lived refresh credential."""
+
+    def __init__(self, client_id, client_secret, refresh_token, *, session=None,
+                 timeout=10, clock=time.monotonic):
+        self._client_id = str(client_id or "").strip()
+        self._client_secret = str(client_secret or "").strip()
+        self._refresh_token = str(refresh_token or "").strip()
+        if not all((self._client_id, self._client_secret, self._refresh_token)):
+            raise ValueError("Google OAuth refresh credentials are required")
+        if session is None and requests is None:
+            raise RuntimeError("requests is required for Google OAuth refresh")
+        self._session = session or requests.Session()
+        self._timeout = timeout
+        self._clock = clock
+        self._token = None
+        self._expires_at = 0.0
+        self._lock = threading.Lock()
+
+    @classmethod
+    def from_environment(cls, environ=None, *, session=None, timeout=10):
+        environment = os.environ if environ is None else environ
+        legacy = str(environment.get(ACCESS_TOKEN_ENV) or "").strip()
+        credentials = tuple(str(environment.get(name) or "").strip() for name in (
+            CLIENT_ID_ENV, CLIENT_SECRET_ENV, REFRESH_TOKEN_ENV
+        ))
+        if all(credentials):
+            return cls(*credentials, session=session, timeout=timeout)
+        if any(credentials):
+            raise ValueError("Google OAuth refresh credentials are incomplete")
+        if legacy:
+            return BearerTokenProvider(legacy)
+        raise ValueError("Google OAuth refresh credentials are required")
+
+    def __call__(self):
+        if self._token is not None and self._clock() < self._expires_at:
+            return self._token
+        with self._lock:
+            if self._token is None or self._clock() >= self._expires_at:
+                self._refresh_locked()
+            return self._token
+
+    def refresh(self):
+        with self._lock:
+            return self._refresh_locked()
+
+    def refresh_if_stale(self, stale_token):
+        """Refresh once when concurrent requests rejected the same token."""
+        with self._lock:
+            if self._token is not None and self._token != stale_token:
+                return self._token
+            return self._refresh_locked()
+
+    def _refresh_locked(self):
+        try:
+            response = self._session.post(
+                TOKEN_URL,
+                data={"client_id": self._client_id, "client_secret": self._client_secret,
+                      "refresh_token": self._refresh_token, "grant_type": "refresh_token"},
+                timeout=self._timeout,
+            )
+        except Exception:
+            # Do not retain the transport exception: it may echo request data.
+            raise GoogleAdapterError("Google OAuth token refresh failed") from None
+        if response.status_code != 200:
+            raise GoogleAdapterError("Google OAuth token refresh failed")
+        payload = _json_response(response, "Google OAuth token refresh")
+        token = str(payload.get("access_token") or "").strip()
+        try:
+            expires_in = float(payload.get("expires_in"))
+        except (TypeError, ValueError) as exc:
+            raise GoogleAdapterError("Malformed Google OAuth token refresh response") from exc
+        if not token or expires_in <= 0:
+            raise GoogleAdapterError("Malformed Google OAuth token refresh response")
+        self._token = token
+        refresh_margin = min(60.0, expires_in * 0.1)
+        self._expires_at = self._clock() + expires_in - refresh_margin
+        return token
+
 
 class _GoogleRestAdapter:
     def __init__(self, token_provider, *, session=None, timeout=30):
@@ -106,6 +194,21 @@ class _GoogleRestAdapter:
             raise GoogleAdapterError("Google access token is unavailable")
         return {"Authorization": f"Bearer {token}"}
 
+    def _request(self, method, url, **kwargs):
+        kwargs["headers"] = {**kwargs.get("headers", {}), **self._headers()}
+        stale_token = kwargs["headers"]["Authorization"].removeprefix("Bearer ")
+        kwargs.setdefault("timeout", self._timeout)
+        response = getattr(self._session, method)(url, **kwargs)
+        if response.status_code == 401 and callable(getattr(self._token_provider, "refresh", None)):
+            refresh_if_stale = getattr(self._token_provider, "refresh_if_stale", None)
+            if callable(refresh_if_stale):
+                refresh_if_stale(stale_token)
+            else:
+                self._token_provider.refresh()
+            kwargs["headers"] = {**kwargs.get("headers", {}), **self._headers()}
+            response = getattr(self._session, method)(url, **kwargs)
+        return response
+
 
 class GoogleDriveAdapter(_GoogleRestAdapter):
     """Idempotent Drive upload using a durable, pre-generated file ID."""
@@ -122,7 +225,7 @@ class GoogleDriveAdapter(_GoogleRestAdapter):
     @classmethod
     def from_environment(cls, *, environ=None, session=None, token_provider=None):
         environment = os.environ if environ is None else environ
-        provider = token_provider or BearerTokenProvider.from_environment(environment)
+        provider = token_provider or RefreshingTokenProvider.from_environment(environment)
         return cls(
             _required_environment(environment, SLIP_FOLDER_ENV),
             provider,
@@ -130,11 +233,9 @@ class GoogleDriveAdapter(_GoogleRestAdapter):
         )
 
     def reserve_file_id(self):
-        response = self._session.get(
+        response = self._request("get",
             f"{self.API}/files/generateIds",
-            headers=self._headers(),
             params={"count": 1, "space": "drive", "type": "files"},
-            timeout=self._timeout,
         )
         if response.status_code != 200:
             raise GoogleAdapterError("Drive file ID reservation failed")
@@ -167,14 +268,11 @@ class GoogleDriveAdapter(_GoogleRestAdapter):
             f"{json.dumps(metadata, separators=(',', ':'))}\r\n"
             f"--{boundary}\r\nContent-Type: {mime_type}\r\n\r\n"
         ).encode("utf-8") + source.read_bytes() + f"\r\n--{boundary}--\r\n".encode()
-        headers = self._headers()
-        headers["Content-Type"] = f"multipart/related; boundary={boundary}"
-        response = self._session.post(
+        response = self._request("post",
             f"{self.UPLOAD_API}/files",
-            headers=headers,
+            headers={"Content-Type": f"multipart/related; boundary={boundary}"},
             params={"uploadType": "multipart", "fields": "id,webViewLink,appProperties,parents"},
             data=body,
-            timeout=self._timeout,
         )
         if response.status_code in {200, 201}:
             return self._validate_file(_json_response(response, "Drive upload"), file_id, transaction_key)
@@ -192,11 +290,9 @@ class GoogleDriveAdapter(_GoogleRestAdapter):
         return result
 
     def _get_existing(self, file_id, transaction_id):
-        response = self._session.get(
+        response = self._request("get",
             f"{self.API}/files/{urllib.parse.quote(file_id, safe='')}",
-            headers=self._headers(),
             params={"fields": "id,webViewLink,appProperties,parents"},
-            timeout=self._timeout,
         )
         if response.status_code == 404:
             return None
@@ -232,7 +328,7 @@ class GoogleSheetsAdapter(_GoogleRestAdapter):
     @classmethod
     def from_environment(cls, *, environ=None, session=None, token_provider=None):
         environment = os.environ if environ is None else environ
-        provider = token_provider or BearerTokenProvider.from_environment(environment)
+        provider = token_provider or RefreshingTokenProvider.from_environment(environment)
         return cls(
             _required_environment(environment, SPREADSHEET_ENV),
             provider,
@@ -241,10 +337,8 @@ class GoogleSheetsAdapter(_GoogleRestAdapter):
 
     def validate_schema(self):
         for title, expected in CANONICAL_SCHEMAS.items():
-            response = self._session.get(
+            response = self._request("get",
                 f"{self.API}/{self.spreadsheet_id}/values/{urllib.parse.quote(title + '!1:1', safe='!')}",
-                headers=self._headers(),
-                timeout=self._timeout,
             )
             if response.status_code != 200:
                 raise IncompatibleSchemaError(f"Cannot validate {title} schema")
@@ -281,11 +375,10 @@ class GoogleSheetsAdapter(_GoogleRestAdapter):
             ]
         }
         write_claim.assert_owner(minimum_valid_seconds=self._timeout + 5)
-        response = self._session.post(
+        response = self._request("post",
             f"{self.API}/{self.spreadsheet_id}:batchUpdate",
-            headers={**self._headers(), "Content-Type": "application/json"},
+            headers={"Content-Type": "application/json"},
             json=requests_body,
-            timeout=self._timeout,
         )
         if response.status_code == 200:
             _json_response(response, "Sheets append")
@@ -303,11 +396,9 @@ class GoogleSheetsAdapter(_GoogleRestAdapter):
         return self._find_row(str(uuid.UUID(str(transaction_id))), required=True)
 
     def _transactions_sheet_id(self):
-        response = self._session.get(
+        response = self._request("get",
             f"{self.API}/{self.spreadsheet_id}",
-            headers=self._headers(),
             params={"fields": "sheets.properties(sheetId,title)"},
-            timeout=self._timeout,
         )
         if response.status_code != 200:
             raise GoogleAdapterError("Sheets metadata lookup failed")
@@ -322,9 +413,8 @@ class GoogleSheetsAdapter(_GoogleRestAdapter):
         return matches[0]
 
     def _find_row(self, transaction_id, *, required):
-        response = self._session.get(
+        response = self._request("get",
             f"{self.API}/{self.spreadsheet_id}/values/{urllib.parse.quote('Transactions!A:A', safe='!')}",
-            headers=self._headers(), timeout=self._timeout,
         )
         if response.status_code != 200:
             raise GoogleAdapterError("Sheets row recovery failed")
@@ -392,6 +482,9 @@ class ProductionSavePipeline:
             state = record["current_state"]
             if state == "confirmed":
                 return record
+            # Validate before the first external checkpoint, including recovery
+            # of rows created by an older runtime.
+            GoogleSheetsAdapter._transaction_row(record)
             if state == "sheets_pending":
                 try:
                     claim = self._flow.claim_sheets_write(

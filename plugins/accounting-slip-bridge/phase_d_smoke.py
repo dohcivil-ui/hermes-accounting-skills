@@ -20,8 +20,13 @@ def verify(transaction_id, chat_id, telegram_user_id, minimum_retry_count=0):
     store = transaction_flow.SQLiteStateStore.from_environment()
     try:
         flow = transaction_flow.TransactionFlow.from_environment(store)
-        drive_adapter = google_adapters.GoogleDriveAdapter.from_environment()
-        sheets_adapter = google_adapters.GoogleSheetsAdapter.from_environment()
+        provider = google_adapters.RefreshingTokenProvider.from_environment()
+        drive_adapter = google_adapters.GoogleDriveAdapter.from_environment(
+            token_provider=provider
+        )
+        sheets_adapter = google_adapters.GoogleSheetsAdapter.from_environment(
+            token_provider=provider
+        )
         pipeline = google_adapters.ProductionSavePipeline(
             flow, drive_adapter, sheets_adapter
         )

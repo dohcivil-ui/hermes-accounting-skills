@@ -4,6 +4,7 @@ from pathlib import Path
 import sqlite3
 import sys
 import tempfile
+import threading
 import unittest
 
 
@@ -154,7 +155,7 @@ class MissingReferenceSchemaMigrationTests(unittest.TestCase):
             ocr_result={"parsed": {}, "confidence": 1.0},
         )
 
-    def test_legacy_database_migrates_idempotently_without_row_mutation(self):
+    def test_legacy_database_migrates_idempotently_without_losing_state(self):
         for _ in range(3):
             store, flow = self._open()
             record = flow.get_transaction(self.transaction_id, **self.actor)
@@ -162,6 +163,136 @@ class MissingReferenceSchemaMigrationTests(unittest.TestCase):
             self.assertEqual(record["current_state"], "waiting_review")
             self.assertEqual(record["version"], 7)
             self.assertFalse(record["needs_reference"])
+            self.assertTrue(record["needs_amount"])
+            self.assertEqual(record["entry_mode"], "amount")
+            store.close()
+
+    def test_legacy_missing_amount_is_recoverable_in_original_state(self):
+        store, flow = self._open()
+        try:
+            pending = flow.get_manual_pending(**self.actor)
+            self.assertEqual(pending["transaction_id"], self.transaction_id)
+            self.assertEqual(pending["current_state"], "waiting_review")
+            updated = flow.submit_manual(
+                self.transaction_id,
+                expected_version=pending["version"],
+                value="99.95",
+                **self.actor,
+            )
+            recovered = flow.get_transaction(updated["transaction_id"], **self.actor)
+            self.assertEqual(recovered["current_state"], "waiting_review")
+            self.assertEqual(recovered["version"], 8)
+            self.assertFalse(recovered["needs_amount"])
+            self.assertEqual(recovered["ocr_fields"]["amount"], 99.95)
+        finally:
+            store.close()
+
+    def test_legacy_valid_amount_keeps_state_version_and_entry_mode(self):
+        connection = sqlite3.connect(self.db_path)
+        try:
+            connection.execute(
+                "UPDATE transaction_state SET ocr_fields_json = ? WHERE transaction_id = ?",
+                (json.dumps({"reference_no": LEGACY_REFERENCE, "amount": 10.25}), self.transaction_id),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        store, flow = self._open()
+        try:
+            record = flow.get_transaction(self.transaction_id, **self.actor)
+            self.assertEqual(record["current_state"], "waiting_review")
+            self.assertEqual(record["version"], 7)
+            self.assertFalse(record["needs_amount"])
+            self.assertIsNone(record["entry_mode"])
+            self.assertEqual(record["ocr_fields"]["amount"], 10.25)
+        finally:
+            store.close()
+
+    def test_concurrent_legacy_database_open_serializes_additive_migration(self):
+        start = threading.Barrier(3)
+        errors = []
+        states = []
+
+        def worker():
+            start.wait(timeout=5)
+            try:
+                store, flow = self._open()
+                try:
+                    record = flow.get_transaction(self.transaction_id, **self.actor)
+                    states.append((record["current_state"], record["version"], record["needs_amount"]))
+                finally:
+                    store.close()
+            except Exception as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=worker) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        start.wait(timeout=5)
+        for thread in threads:
+            thread.join(timeout=10)
+            self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(states, [("waiting_review", 7, True)] * 2)
+
+    def test_fresh_database_creates_unique_handoff_index(self):
+        fresh_path = self.root / "state" / "fresh.sqlite3"
+        store = self.module.SQLiteStateStore(fresh_path)
+        try:
+            indexes = {
+                row["name"]
+                for row in store._connection.execute(
+                    "PRAGMA index_list(transaction_state)"
+                )
+            }
+            self.assertIn("uq_transaction_handoff", indexes)
+        finally:
+            store.close()
+
+    def test_duplicate_handoff_key_recovers_existing_transaction(self):
+        store, flow = self._open()
+        try:
+            first = self._begin_missing(flow, "duplicate-handoff")
+            duplicate = self._begin_missing(flow, "duplicate-handoff")
+            count = store._connection.execute(
+                "SELECT COUNT(*) FROM transaction_state WHERE handoff_key = ?",
+                ("duplicate-handoff",),
+            ).fetchone()[0]
+
+            self.assertEqual(duplicate["transaction_id"], first["transaction_id"])
+            self.assertEqual(count, 1)
+        finally:
+            store.close()
+
+    def test_legacy_prompt_message_migrates_to_delivered(self):
+        connection = sqlite3.connect(self.db_path)
+        try:
+            connection.execute(
+                """
+                UPDATE transaction_state
+                SET initial_prompt_message_id = ?, initial_prompt_state = 'pending',
+                    initial_prompt_owner = ?, initial_prompt_lease_expires_at = ?
+                WHERE transaction_id = ?
+                """,
+                (
+                    "legacy-message-id",
+                    "legacy-owner",
+                    "2099-01-01T00:00:00+00:00",
+                    self.transaction_id,
+                ),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        store, flow = self._open()
+        try:
+            record = flow.get_transaction(self.transaction_id, **self.actor)
+            self.assertEqual(record["initial_prompt_state"], "delivered")
+            self.assertIsNone(record["initial_prompt_owner"])
+            self.assertIsNone(record["initial_prompt_lease_expires_at"])
+            self.assertEqual(record["initial_prompt_message_id"], "legacy-message-id")
+        finally:
             store.close()
 
     def test_missing_rows_coexist_and_reference_assignment_is_unique(self):
