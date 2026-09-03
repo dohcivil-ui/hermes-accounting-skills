@@ -418,7 +418,7 @@ class SQLiteStateStore:
             """
             SELECT * FROM transaction_state
             WHERE platform = ? AND chat_id = ? AND telegram_user_id = ?
-              AND current_state NOT IN ('confirmed', 'cancelled', 'failed')
+              AND current_state NOT IN ('confirmed', 'cancelled')
               AND entry_mode IS NOT NULL
             ORDER BY updated_at DESC
             """,
@@ -1009,7 +1009,7 @@ class TransactionFlow:
                 self._store.clear_manual_selection(**actor)
                 raise StaleStateError("Selected manual transaction is stale")
             if record.get("entry_mode") is None or record["current_state"] in {
-                "confirmed", "cancelled", "failed"
+                "confirmed", "cancelled"
             }:
                 self._store.clear_manual_selection(**actor)
                 raise InvalidTransitionError("Selected manual input is no longer pending")
@@ -1030,7 +1030,7 @@ class TransactionFlow:
         )
         self._require_current_version(record, expected_version)
         if record.get("entry_mode") is None or record["current_state"] in {
-            "confirmed", "cancelled", "failed"
+            "confirmed", "cancelled"
         }:
             raise InvalidTransitionError("Transaction has no pending manual input")
         self._store.set_manual_selection(
