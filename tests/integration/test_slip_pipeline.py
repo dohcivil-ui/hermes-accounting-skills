@@ -107,7 +107,7 @@ class SlipPipelineIntegrationTests(unittest.TestCase):
         self.store.close()
         self.temp_dir.cleanup()
 
-    def begin(self, reference_no="SYNTHETIC-REF-001", session_id="session-1"):
+    def begin(self, reference_no="SYNTHETIC-REF-001", session_id="session-1", amount="1,250.50"):
         return self.flow.begin(
             tenant_id="tenant-a",
             platform="telegram",
@@ -120,7 +120,7 @@ class SlipPipelineIntegrationTests(unittest.TestCase):
                 "confidence": 0.98,
                 "parsed": {
                     "reference_no": reference_no,
-                    "amount": "1,250.50",
+                    "amount": amount,
                     "date": "2026-08-30",
                     "payer": "Synthetic Payer",
                     "payee": "Synthetic Payee",
@@ -164,6 +164,48 @@ class SlipPipelineIntegrationTests(unittest.TestCase):
         self.assertEqual(pending["source_image_path"], str(self.slip_path.resolve()))
         self.assertEqual(pending["reference_no"], "SYNTHETIC-REF-001")
         self.assertEqual(pending["current_state"], "waiting_project")
+
+    def test_missing_or_invalid_amount_waits_for_durable_manual_decimal(self):
+        invalid_amounts = (
+            None, "not-a-number", 0, -1, "NaN", "Infinity", "1,2,3",
+            "9007199254740993", "0.123456789012345678901",
+        )
+        for index, amount in enumerate(invalid_amounts):
+            view = self.begin(f"SYNTHETIC-AMOUNT-{index}", f"session-amount-{index}", amount=amount)
+            pending = self.flow.get_transaction(view["transaction_id"], **self.actor)
+            self.assertTrue(pending["needs_amount"])
+            self.assertEqual(pending["entry_mode"], "amount")
+            with self.assertRaises(self.module.InvalidTransitionError):
+                self.flow.choose(
+                    view["transaction_id"], expected_version=view["version"],
+                    action="select_project", value="Project A", **self.actor
+                )
+            with self.assertRaises(ValueError):
+                self.flow.submit_manual(
+                    view["transaction_id"], expected_version=view["version"],
+                    value="0", **self.actor
+                )
+            restarted_store = self.module.SQLiteStateStore(self.store.path)
+            try:
+                restarted_flow = self.module.TransactionFlow(
+                    restarted_store, allowed_source_roots=[self.runtime_root],
+                    projects=["Project A"]
+                )
+                recovered = restarted_flow.get_manual_pending(**self.actor)
+                self.assertEqual(recovered["transaction_id"], view["transaction_id"])
+                updated = restarted_flow.submit_manual(
+                    view["transaction_id"], expected_version=view["version"],
+                    value="123.45", **self.actor
+                )
+                durable = restarted_flow.get_transaction(updated["transaction_id"], **self.actor)
+                self.assertFalse(durable["needs_amount"])
+                self.assertEqual(durable["ocr_fields"]["amount"], 123.45)
+            finally:
+                restarted_store.close()
+
+        exact = self.begin("SYNTHETIC-AMOUNT-EXACT", "session-amount-exact", amount="1,234.50")
+        exact_record = self.flow.get_transaction(exact["transaction_id"], **self.actor)
+        self.assertEqual(exact_record["ocr_fields"]["amount"], 1234.5)
 
     def test_project_selection_supports_back_and_cancel(self):
         view = self.begin()

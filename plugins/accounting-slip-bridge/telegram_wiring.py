@@ -261,7 +261,7 @@ class TelegramTransactionController:
                 ),
             })
 
-        if record.get("needs_reference"):
+        if record.get("needs_reference") or record.get("needs_amount"):
             button("❌ ยกเลิก", "cancel")
         elif state == "waiting_project":
             if record.get("entry_mode") in {"new_project", "manual_entry"}:
@@ -356,6 +356,12 @@ class TelegramTransactionController:
         try:
             self._save_pipeline.save(transaction_id, **actor)
             return self._success(transaction_id, actor)
+        except (ValueError,) as exc:
+            result = self._flow_error(exc)
+            result["error_code"] = "validation_error"
+            result["message"] = str(exc)
+            result["prompt"] = self.render(transaction_id, **actor)
+            return result
         except Exception:
             record = self._flow.get_transaction(transaction_id, **actor)
             if record["current_state"] in {
@@ -391,6 +397,12 @@ class TelegramTransactionController:
 
     def _flow_error(self, exc):
         name = exc.__class__.__name__
+        if name == "ValueError":
+            return {
+                "ok": False,
+                "error_code": "validation_error",
+                "message": str(exc),
+            }
         codes = {
             "AuthorizationError": "unauthorized",
             "StaleStateError": "stale_callback",
@@ -412,6 +424,8 @@ class TelegramTransactionController:
         state = record["current_state"]
         if record.get("needs_reference"):
             return "พิมพ์หมายเลขอ้างอิงจากสลิปก่อนดำเนินการต่อ"
+        if record.get("needs_amount"):
+            return "กรุณาพิมพ์ยอดเงินที่มากกว่า 0 (รองรับทศนิยม)"
         if state == "waiting_project" and record.get("entry_mode") == "new_project":
             return "พิมพ์ชื่อโครงการใหม่"
         if state == "waiting_project" and record.get("entry_mode") == "manual_entry":

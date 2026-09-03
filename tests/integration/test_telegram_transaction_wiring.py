@@ -170,6 +170,46 @@ class TelegramTransactionWiringTests(unittest.TestCase):
         self.assertEqual(durable["transaction_type"], "expense")
         self.assertEqual(durable["category"], "materials")
 
+    def test_missing_amount_prompts_for_manual_value_before_any_save(self):
+        record = self.flow.begin(
+            tenant_id="tenant-test", platform="telegram", chat_id="1001",
+            thread_id=None, session_id="missing-amount", telegram_user_id="2002",
+            source_image_path=self.slip,
+            ocr_result={"parsed": {"reference_no": "PHASE-C-NO-AMOUNT", "amount": None}},
+        )
+        prompt = self.controller.render(record["transaction_id"], **self.actor)
+        self.assertTrue(prompt["manual_input_required"])
+        self.assertIn("ยอดเงิน", prompt["text"])
+        self.assertEqual(self.pipeline.calls, 0)
+
+        invalid = self.controller.handle_manual_message("not-a-number", **self.actor)
+        self.assertEqual(invalid["error_code"], "validation_error")
+        self.assertNotIn(invalid["error_code"], {"DRIVE_TRANSIENT", "SHEETS_TRANSIENT"})
+        self.assertEqual(self.pipeline.calls, 0)
+
+        valid = self.controller.handle_manual_message("250.75", **self.actor)
+        self.assertTrue(valid["ok"])
+        self.assertEqual(valid["prompt"]["current_state"], "waiting_project")
+        self.assertEqual(self.pipeline.calls, 0)
+
+    def test_save_validation_error_is_not_classified_as_external_transient(self):
+        class ValidationPipeline:
+            def save(self, transaction_id, **actor):
+                raise ValueError("Transaction amount must be valid")
+
+        controller = self.wiring.TelegramTransactionController(
+            self.flow, ValidationPipeline(), projects=["Project A", "Project B"]
+        )
+        review = self.advance_to_review()
+        result = controller.handle_callback(
+            self.callback(review, "confirm"), **self.actor
+        )
+        durable = self.flow.get_transaction(self.record["transaction_id"], **self.actor)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error_code"], "validation_error")
+        self.assertIsNone(durable["last_error_code"])
+        self.assertEqual(durable["current_state"], "confirmed_intent")
+
     def test_back_and_cancel_use_durable_state(self):
         prompt = self.controller.render(self.record["transaction_id"], **self.actor)
         prompt = self.click(prompt, "select_project", "Project A")["prompt"]
@@ -678,7 +718,9 @@ class TelegramTransactionWiringTests(unittest.TestCase):
         try:
             with self.assertLogs(
                 "lekza.accounting_transaction_buttons", level="INFO"
-            ) as captured:
+            ) as captured, patch.object(
+                plugin, "_start_registered_handler_watch", return_value=None
+            ):
                 plugin.register(Context())
             self.assertIn(
                 "registered handler rebind text=1 callback=1",

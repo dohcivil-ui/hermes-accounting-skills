@@ -7,12 +7,15 @@ existing OCR result, while later production adapters consume durable state.
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
 import hashlib
 import json
 import math
 import os
 from pathlib import Path
+import re
 import sqlite3
+import time
 import unicodedata
 import uuid
 
@@ -43,6 +46,7 @@ MUTABLE_STATE_COLUMNS = {
     "reference_no_normalized",
     "ocr_fields_json",
     "needs_reference",
+    "needs_amount",
     "project",
     "transaction_type",
     "category",
@@ -133,13 +137,26 @@ def _normalize_reference(reference_no):
 def _as_number(value):
     if isinstance(value, bool) or value is None:
         raise ValueError("Amount must be a number")
+    text = str(value).strip()
+    if not re.fullmatch(r"(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?", text):
+        raise ValueError("Amount must be a number")
     try:
-        amount = float(str(value).replace(",", "").strip())
-    except (TypeError, ValueError) as exc:
+        amount = Decimal(text.replace(",", ""))
+    except InvalidOperation as exc:
         raise ValueError("Amount must be a number") from exc
-    if not math.isfinite(amount):
+    if not amount.is_finite():
         raise ValueError("Amount must be a finite number")
-    return amount
+    if amount <= 0:
+        raise ValueError("Amount must be greater than zero")
+    if amount == amount.to_integral_value():
+        integer = int(amount)
+        if integer > 2**53 - 1:
+            raise ValueError("Amount exceeds safe numeric precision")
+        return integer
+    numeric = float(amount)
+    if not math.isfinite(numeric) or Decimal(str(numeric)) != amount:
+        raise ValueError("Amount exceeds safe numeric precision")
+    return numeric
 
 
 class SQLiteStateStore:
@@ -155,9 +172,22 @@ class SQLiteStateStore:
             str(self.path), timeout=10, check_same_thread=False
         )
         self._connection.row_factory = sqlite3.Row
-        self._connection.execute("PRAGMA journal_mode=WAL")
         self._connection.execute("PRAGMA busy_timeout=10000")
-        self._create_schema()
+        deadline = time.monotonic() + 10
+        while True:
+            try:
+                self._connection.execute("PRAGMA journal_mode=WAL")
+                break
+            except sqlite3.OperationalError as exc:
+                if "locked" not in str(exc).lower() or time.monotonic() >= deadline:
+                    self._connection.close()
+                    raise
+                time.sleep(0.05)
+        try:
+            self._create_schema()
+        except Exception:
+            self._connection.close()
+            raise
 
     @classmethod
     def from_environment(cls, environ=None):
@@ -182,6 +212,7 @@ class SQLiteStateStore:
                 reference_no TEXT NOT NULL,
                 reference_no_normalized TEXT NOT NULL,
                 needs_reference INTEGER NOT NULL DEFAULT 0,
+                needs_amount INTEGER NOT NULL DEFAULT 0,
                 source_image_path TEXT NOT NULL,
                 ocr_fields_json TEXT NOT NULL,
                 confidence REAL,
@@ -224,10 +255,6 @@ class SQLiteStateStore:
             """
         )
         self._connection.commit()
-        columns = {
-            row["name"]
-            for row in self._connection.execute("PRAGMA table_info(transaction_state)")
-        }
         migrations = {
             "drive_upload_id": "TEXT",
             "sheets_claim_owner": "TEXT",
@@ -239,23 +266,58 @@ class SQLiteStateStore:
             "initial_prompt_message_id": "TEXT",
             "handoff_key": "TEXT",
             "needs_reference": "INTEGER NOT NULL DEFAULT 0",
+            "needs_amount": "INTEGER NOT NULL DEFAULT 0",
         }
-        for column, definition in migrations.items():
-            if column in columns:
-                continue
-            with self._connection:
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            columns = {
+                row["name"]
+                for row in self._connection.execute(
+                    "PRAGMA table_info(transaction_state)"
+                )
+            }
+            for column, definition in migrations.items():
+                if column in columns:
+                    continue
                 self._connection.execute(
                     f"ALTER TABLE transaction_state ADD COLUMN {column} {definition}"
                 )
-        with self._connection:
+            for row in self._connection.execute(
+                """
+                SELECT transaction_id, ocr_fields_json, current_state
+                FROM transaction_state
+                WHERE needs_amount = 0
+                  AND current_state NOT IN ('confirmed', 'cancelled')
+                """
+            ).fetchall():
+                try:
+                    fields = json.loads(row["ocr_fields_json"])
+                    _as_number(fields.get("amount"))
+                except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
+                    self._connection.execute(
+                        """
+                        UPDATE transaction_state
+                        SET needs_amount = 1,
+                            entry_mode = CASE
+                                WHEN needs_reference = 1 THEN entry_mode
+                                ELSE 'amount'
+                            END
+                        WHERE transaction_id = ?
+                        """,
+                        (row["transaction_id"],),
+                    )
             self._connection.execute("DROP INDEX IF EXISTS uq_active_reference")
             self._connection.execute(
                 """
-                CREATE UNIQUE INDEX uq_active_reference
+                CREATE UNIQUE INDEX IF NOT EXISTS uq_active_reference
                 ON transaction_state(tenant_id, reference_no_normalized)
                 WHERE current_state <> 'cancelled' AND needs_reference = 0
                 """
             )
+            self._connection.commit()
+        except Exception:
+            self._connection.rollback()
+            raise
             self._connection.execute(
                 """
                 UPDATE transaction_state
@@ -326,7 +388,7 @@ class SQLiteStateStore:
             """
             SELECT * FROM transaction_state
             WHERE platform = ? AND chat_id = ? AND telegram_user_id = ?
-              AND current_state IN ('waiting_project', 'waiting_category')
+              AND current_state NOT IN ('confirmed', 'cancelled', 'failed')
               AND entry_mode IS NOT NULL
             ORDER BY updated_at DESC
             LIMIT 2
@@ -690,6 +752,7 @@ class SQLiteStateStore:
         record["history"] = json.loads(record.pop("history_json"))
         record["new_project"] = bool(record["new_project"])
         record["needs_reference"] = bool(record["needs_reference"])
+        record["needs_amount"] = bool(record["needs_amount"])
         return record
 
     def close(self):
@@ -763,8 +826,13 @@ class TransactionFlow:
         }
         if not needs_reference:
             minimal_fields["reference_no"] = reference_no
+        needs_amount = True
         if "amount" in minimal_fields:
-            minimal_fields["amount"] = _as_number(minimal_fields["amount"])
+            try:
+                minimal_fields["amount"] = _as_number(minimal_fields["amount"])
+                needs_amount = False
+            except ValueError:
+                minimal_fields.pop("amount", None)
         now = _utc_now()
         transaction_id = str(uuid.uuid4())
         record = self._store.create(
@@ -780,12 +848,13 @@ class TransactionFlow:
                 "reference_no": reference_no,
                 "reference_no_normalized": reference_key,
                 "needs_reference": 1 if needs_reference else 0,
+                "needs_amount": 1 if needs_amount else 0,
                 "source_image_path": str(source_path),
                 "ocr_fields_json": json.dumps(
                     minimal_fields, ensure_ascii=False, separators=(",", ":")
                 ),
                 "confidence": ocr_result.get("confidence"),
-                "entry_mode": "reference" if needs_reference else None,
+                "entry_mode": "reference" if needs_reference else ("amount" if needs_amount else None),
                 "current_state": "waiting_project",
                 "created_at": now,
                 "updated_at": now,
@@ -950,6 +1019,8 @@ class TransactionFlow:
             transaction_id, platform, chat_id, telegram_user_id
         )
         self._require_current_version(record, expected_version)
+        if record.get("needs_amount"):
+            raise InvalidTransitionError("Transaction requires a valid amount")
         if record["current_state"] == "waiting_project" and action == "select_project":
             if value not in self._projects:
                 raise ValueError("Project is not available")
@@ -1078,13 +1149,33 @@ class TransactionFlow:
                             separators=(",", ":"),
                         ),
                         "needs_reference": 0,
-                        "entry_mode": None,
+                        "entry_mode": "amount" if record.get("needs_amount") else None,
                     },
                 )
             except sqlite3.IntegrityError as exc:
                 raise DuplicateReferenceError(
                     "Reference number already exists for this tenant"
                 ) from exc
+            return self._view(updated)
+        if record["entry_mode"] == "amount":
+            amount = _as_number(manual_value)
+            ocr_fields = dict(record["ocr_fields"])
+            ocr_fields["amount"] = amount
+            updated = self._store.transition(
+                transaction_id,
+                platform=platform,
+                chat_id=chat_id,
+                telegram_user_id=telegram_user_id,
+                expected_version=expected_version,
+                allowed_from={record["current_state"]},
+                changes={
+                    "ocr_fields_json": json.dumps(
+                        ocr_fields, ensure_ascii=False, separators=(",", ":")
+                    ),
+                    "needs_amount": 0,
+                    "entry_mode": None,
+                },
+            )
             return self._view(updated)
         if record["current_state"] == "waiting_project" and record[
             "entry_mode"
@@ -1137,6 +1228,7 @@ class TransactionFlow:
         if record["current_state"] != "waiting_review":
             raise InvalidTransitionError("Transaction is not ready for confirmation")
         self._require_valid_reference(record)
+        self._require_valid_amount(record)
         try:
             updated = self._store.transition(
                 transaction_id,
@@ -1170,6 +1262,7 @@ class TransactionFlow:
         )
         self._require_current_version(record, expected_version)
         self._require_valid_reference(record)
+        self._require_valid_amount(record)
         return self._transition_state(
             transaction_id,
             expected_version=expected_version,
@@ -1549,6 +1642,19 @@ class TransactionFlow:
         except ValueError as exc:
             raise InvalidTransitionError(
                 "Transaction reference number is invalid"
+            ) from exc
+
+    @staticmethod
+    def _require_valid_amount(record):
+        if record.get("needs_amount"):
+            raise InvalidTransitionError(
+                "Transaction requires a valid amount before confirmation"
+            )
+        try:
+            _as_number((record.get("ocr_fields") or {}).get("amount"))
+        except ValueError as exc:
+            raise InvalidTransitionError(
+                "Transaction amount must be greater than zero"
             ) from exc
 
     def _validate_source_path(self, source_image_path):

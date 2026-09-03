@@ -71,10 +71,11 @@ def _controller_from_environment():
             raise ValueError("LEKZA_ACTIVE_PROJECTS_JSON must be a JSON string list")
         store = flow_module.SQLiteStateStore.from_environment()
         flow = flow_module.TransactionFlow.from_environment(store, projects=projects)
+        token_provider = google.RefreshingTokenProvider.from_environment()
         pipeline = google.ProductionSavePipeline(
             flow,
-            google.GoogleDriveAdapter.from_environment(),
-            google.GoogleSheetsAdapter.from_environment(),
+            google.GoogleDriveAdapter.from_environment(token_provider=token_provider),
+            google.GoogleSheetsAdapter.from_environment(token_provider=token_provider),
         )
         _CONTROLLER = wiring.TelegramTransactionController(
             flow,
