@@ -24,6 +24,7 @@ from zoneinfo import ZoneInfo
 
 BANGKOK = ZoneInfo("Asia/Bangkok")
 REPORT_TYPES = frozenset({"daily", "weekly", "monthly"})
+KNOWN_TRANSACTION_STATUSES = frozenset({"confirmed", "deleted"})
 CATEGORY_LABELS = {
     "labor": "ค่าแรง",
     "materials": "วัสดุ",
@@ -207,7 +208,10 @@ def aggregate_report(report_type, period, project_rows, transaction_rows):
         status = row.get("status")
         if not isinstance(status, str) or not status.strip():
             raise MalformedSheetRowError("Transactions.status is required")
-        if status.strip() != "confirmed":
+        status = status.strip()
+        if status not in KNOWN_TRANSACTION_STATUSES:
+            raise MalformedSheetRowError("Transactions.status is unknown")
+        if status != "confirmed":
             continue
         try:
             transaction_date = date.fromisoformat(str(row.get("date") or ""))

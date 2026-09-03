@@ -21,6 +21,9 @@ Previous stable release: `v0.1.0`.
 
 ### Fixed
 
+- Reject scheduled-report ledger, archive, and font paths anywhere inside the
+  resolved repository/runtime source tree, and fail closed on unknown
+  transaction statuses while preserving known soft-delete filtering
 - Hermes skill metadata compatibility while preserving the production
   `/data/skills/accounting` runtime path
 - Enum-keyed Telegram adapter lookup and durable handling of remote Telegram
@@ -41,9 +44,9 @@ Previous stable release: `v0.1.0`.
 
 ### Verification
 
-- Focused scheduled-reporting tests: `28 passed`; zero failures and zero errors.
+- Focused scheduled-reporting tests: `30 passed`; zero failures and zero errors.
 - Full synthetic suite excluding the prohibited Phase D smoke module:
-  `173 passed / 1 skipped`; zero failures and zero errors.
+  `175 passed / 1 skipped`; zero failures and zero errors.
 - Intentionally skipped test:
   `live.test_google_adapters_live.GoogleAdaptersLiveSmokeTests.test_confirmed_transaction_reaches_designated_test_drive_and_sheet`.
   It requires explicitly acknowledged disposable Google resources and remains

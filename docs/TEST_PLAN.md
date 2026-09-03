@@ -49,6 +49,12 @@ Sheets access, and durable suppression of duplicate messages and attachments
 across retries and process restarts. These tests perform no live network calls
 and do not invoke the Phase D staging smoke procedure.
 
+Runtime-path regressions reject the repository/runtime source root and every
+descendant for ledger, archive, and font configuration while accepting absolute
+external paths. Reporting accepts only known transaction statuses: `confirmed`
+is aggregated, `deleted` is skipped, and empty, malformed, or unknown values
+fail closed.
+
 ## Phase A durable-state acceptance
 
 The deterministic SQLite integration harness covers:

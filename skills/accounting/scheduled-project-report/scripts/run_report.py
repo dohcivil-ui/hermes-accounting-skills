@@ -27,16 +27,34 @@ def _required(environment, name):
     return value
 
 
-def _absolute_external_path(environment, name, source_roots, *, must_exist=False):
+def _absolute_external_path(environment, name, source_root, *, must_exist=False):
     path = Path(_required(environment, name))
     if not path.is_absolute():
         raise ValueError(f"{name} must be an absolute path")
     resolved = path.resolve()
-    if any(resolved == root or resolved.is_relative_to(root) for root in source_roots):
-        raise ValueError(f"{name} must be outside runtime source directories")
+    source_root = Path(source_root).resolve()
+    if resolved == source_root or resolved.is_relative_to(source_root):
+        raise ValueError(f"{name} must be outside the repository/runtime source root")
     if must_exist and not resolved.is_file():
         raise ValueError(f"{name} must identify an existing file")
     return resolved
+
+
+def resolve_runtime_paths(environment):
+    """Resolve report state paths and reject the complete source tree."""
+    source_root = Path(__file__).resolve().parents[4]
+    return {
+        "ledger": _absolute_external_path(
+            environment, "LEKZA_REPORT_LEDGER_DB", source_root
+        ),
+        "archive": _absolute_external_path(
+            environment, "LEKZA_REPORT_ARCHIVE_ROOT", source_root
+        ),
+        "font": _absolute_external_path(
+            environment, "LEKZA_REPORT_THAI_FONT_PATH", source_root,
+            must_exist=True,
+        ),
+    }
 
 
 def _load_google_module(plugin_root):
@@ -57,20 +75,9 @@ def build_runner(environment=None):
     if runtime_mode not in {"production", "staging"}:
         raise ValueError("LEKZA_RUNTIME_ENV must be production or staging")
 
-    data_root = Path(__file__).resolve().parents[4]
-    skills_root = (data_root / "skills").resolve()
-    plugin_root = (data_root / "plugins").resolve()
-    source_roots = (skills_root, plugin_root)
-    ledger_path = _absolute_external_path(
-        environment, "LEKZA_REPORT_LEDGER_DB", source_roots
-    )
-    archive_root = _absolute_external_path(
-        environment, "LEKZA_REPORT_ARCHIVE_ROOT", source_roots
-    )
-    font_path = _absolute_external_path(
-        environment, "LEKZA_REPORT_THAI_FONT_PATH", source_roots,
-        must_exist=True,
-    )
+    source_root = Path(__file__).resolve().parents[4]
+    plugin_root = (source_root / "plugins").resolve()
+    runtime_paths = resolve_runtime_paths(environment)
 
     google = _load_google_module(plugin_root)
     token_provider = google.RefreshingTokenProvider.from_environment(environment)
@@ -83,12 +90,12 @@ def build_runner(environment=None):
         _required(environment, "LEKZA_REPORT_TELEGRAM_CHAT_ID"),
         thread_id=environment.get("LEKZA_REPORT_TELEGRAM_THREAD_ID"),
     )
-    artifacts = ArtifactBuilder(archive_root, font_path)
+    artifacts = ArtifactBuilder(runtime_paths["archive"], runtime_paths["font"])
     runner = ReportRunner(
         reader,
         sender,
         DeliveryLedger(
-            ledger_path,
+            runtime_paths["ledger"],
             lease_seconds=float(environment.get("LEKZA_REPORT_DELIVERY_LEASE_SECONDS", "120")),
         ),
         artifacts,

@@ -11,11 +11,24 @@ ROOT = Path(__file__).resolve().parents[2]
 MODULE_PATH = (
     ROOT / "skills/accounting/scheduled-project-report/scripts/scheduled_reporting.py"
 )
+RUNNER_PATH = ROOT / "skills/accounting/scheduled-project-report/scripts/run_report.py"
 
 
 def load_module():
     name = "lekza_scheduled_reporting"
     spec = importlib.util.spec_from_file_location(name, MODULE_PATH)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def load_runner_module():
+    name = "lekza_scheduled_report_runner"
+    scripts = str(RUNNER_PATH.parent)
+    if scripts not in sys.path:
+        sys.path.insert(0, scripts)
+    spec = importlib.util.spec_from_file_location(name, RUNNER_PATH)
     module = importlib.util.module_from_spec(spec)
     sys.modules[name] = module
     spec.loader.exec_module(module)
@@ -153,7 +166,13 @@ class PeriodAndAggregationTests(unittest.TestCase):
         )
         projects = [{"project_id": "p1", "project_name": "บ้านตัวอย่าง"}]
         base = {"date": "2026-09-03", "project_id": "p1", "project": "บ้านตัวอย่าง", "type": "income", "category": "", "amount": 100, "payee": "ผู้จ่าย", "status": "confirmed"}
-        for field, value in (("amount", "100"), ("type", "other"), ("status", None)):
+        for field, value in (
+            ("amount", "100"),
+            ("type", "other"),
+            ("status", None),
+            ("status", ""),
+            ("status", "confirmd"),
+        ):
             row = dict(base)
             row[field] = value
             with self.subTest(field=field), self.assertRaises(self.reporting.MalformedSheetRowError):
@@ -218,6 +237,45 @@ class PeriodAndAggregationTests(unittest.TestCase):
                 self.assertEqual(builder.build_monthly_pdf(report).stat().st_mtime, 1)
             finally:
                 builder.close()
+
+
+class RuntimePathSafetyTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.runner = load_runner_module()
+
+    def environment(self, external_root):
+        font = external_root / "thai-font.ttf"
+        font.write_bytes(b"synthetic font placeholder")
+        return {
+            "LEKZA_REPORT_LEDGER_DB": str(external_root / "state" / "reports.sqlite3"),
+            "LEKZA_REPORT_ARCHIVE_ROOT": str(external_root / "archive"),
+            "LEKZA_REPORT_THAI_FONT_PATH": str(font),
+        }
+
+    def test_rejects_repo_root_and_every_repo_subdirectory_for_each_runtime_path(self):
+        forbidden = (ROOT, ROOT / "docs", ROOT / "tests", ROOT / "skills", ROOT / "plugins", ROOT / "docs" / "nested")
+        names = (
+            "LEKZA_REPORT_LEDGER_DB",
+            "LEKZA_REPORT_ARCHIVE_ROOT",
+            "LEKZA_REPORT_THAI_FONT_PATH",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            environment = self.environment(Path(directory))
+            for name in names:
+                for path in forbidden:
+                    candidate = dict(environment)
+                    candidate[name] = str(path)
+                    with self.subTest(name=name, path=path), self.assertRaises(ValueError):
+                        self.runner.resolve_runtime_paths(candidate)
+
+    def test_accepts_absolute_runtime_paths_outside_repository(self):
+        with tempfile.TemporaryDirectory() as directory:
+            external_root = Path(directory).resolve()
+            paths = self.runner.resolve_runtime_paths(self.environment(external_root))
+            self.assertEqual(paths["ledger"], external_root / "state" / "reports.sqlite3")
+            self.assertEqual(paths["archive"], external_root / "archive")
+            self.assertEqual(paths["font"], external_root / "thai-font.ttf")
 
 
 if __name__ == "__main__":

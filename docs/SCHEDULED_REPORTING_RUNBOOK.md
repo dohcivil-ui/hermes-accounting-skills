@@ -29,13 +29,15 @@ in Git:
 - `LEKZA_REPORT_TELEGRAM_BOT_TOKEN`
 - `LEKZA_REPORT_TELEGRAM_CHAT_ID`
 - Optional `LEKZA_REPORT_TELEGRAM_THREAD_ID`
-- `LEKZA_REPORT_LEDGER_DB`: absolute SQLite path outside `/data/skills` and `/data/plugins`
-- `LEKZA_REPORT_ARCHIVE_ROOT`: absolute monthly-PDF archive root outside source directories
-- `LEKZA_REPORT_THAI_FONT_PATH`: absolute path to a Thai-capable TTF such as Noto Sans Thai or TH Sarabun New
+- `LEKZA_REPORT_LEDGER_DB`: absolute SQLite path outside the resolved repository/runtime source root
+- `LEKZA_REPORT_ARCHIVE_ROOT`: absolute monthly-PDF archive root outside the resolved repository/runtime source root
+- `LEKZA_REPORT_THAI_FONT_PATH`: absolute Thai-capable TTF path outside the resolved repository/runtime source root, such as Noto Sans Thai or TH Sarabun New
 - Optional `LEKZA_REPORT_DELIVERY_LEASE_SECONDS`
 
 The archive, ledger, font, credentials, and generated artifacts must remain
-outside Git. Restrict the ledger and archive directories to the runtime user.
+outside the complete repository/runtime source tree, not merely outside the
+`skills` and `plugins` subdirectories. Restrict the ledger and archive
+directories to the runtime user.
 
 ## Cron schedule
 
