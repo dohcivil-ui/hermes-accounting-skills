@@ -19,13 +19,13 @@ metadata:
 |--------|------|
 | รายวัน | ทุกวัน 21:00 น. |
 | รายสัปดาห์ | วันอาทิตย์ 21:10 น. |
-| รายเดือน | วันสิ้นเดือน 21:15 น. |
+| รายเดือน | วันสิ้นเดือน 21:20 น. |
 
 ---
 
 ## รายงานรายวัน
 
-Query: Transactions วันนี้ (status ≠ deleted)
+Query: Transactions วันนี้ (`status = confirmed`)
 
 รูปแบบ:
 ```
@@ -50,7 +50,9 @@ Query: Transactions วันนี้ (status ≠ deleted)
 
 ## รายงานรายสัปดาห์
 
-Query: Transactions 7 วันที่ผ่านมา
+Query: Transactions 7 วันที่ผ่านมา (`status = confirmed`)
+
+Output: Telegram summary และแนบ HTML report (UTF-8)
 
 รูปแบบ:
 ```
@@ -61,6 +63,7 @@ Query: Transactions 7 วันที่ผ่านมา
   💚 เงินเข้า: XX,XXX บาท
   ❤️ เงินออก: XX,XXX บาท
   📌 เหลือสุทธิ: XX,XXX บาท
+  🧾 จำนวนรายการ: X
   👥 คนรับเงินสูงสุด: [ชื่อ] (XX,XXX บาท)
 
 ──────────────────
@@ -68,13 +71,16 @@ Query: Transactions 7 วันที่ผ่านมา
   💚 เงินเข้า: XX,XXX บาท
   ❤️ เงินออก: XX,XXX บาท
   📌 เหลือสุทธิ: XX,XXX บาท
+  🧾 จำนวนรายการรวม: X
 ```
 
 ---
 
 ## รายงานรายเดือน
 
-Query: Transactions เดือนปัจจุบัน
+Query: Transactions เดือนปัจจุบัน (`status = confirmed`)
+
+Output: Telegram summary, HTML report (UTF-8) และ PDF report ที่ embed Thai font
 
 รูปแบบ:
 ```
@@ -101,6 +107,7 @@ Query: Transactions เดือนปัจจุบัน
   💚 เงินเข้า: XX,XXX บาท
   ❤️ เงินออก: XX,XXX บาท
   📌 เหลือสุทธิ: XX,XXX บาท
+  🧾 จำนวนรายการรวม: X
 ```
 
 ---
@@ -108,5 +115,9 @@ Query: Transactions เดือนปัจจุบัน
 ## กฎสำคัญ
 - ใช้ timezone Asia/Bangkok เสมอ
 - นับเฉพาะ status = "confirmed"
-- ไม่นับ status = "deleted"
 - แยกรายงานตามงาน ก่อนรวมยอดรวม
+- แสดงทุกโครงการจาก Projects แม้ไม่มีรายการในช่วงนั้น โดยแสดงยอดและจำนวนเป็น 0
+- รายสัปดาห์นับ 7 วันรวมวันอาทิตย์ที่ส่งรายงาน
+- รายเดือนส่งเฉพาะวันสุดท้ายจริงของเดือน รองรับเดือน 28/29/30/31 วัน
+- PDF รายเดือนเก็บใน archive root ที่กำหนดผ่าน environment
+- cron เรียก `scripts/run_report.py` ด้วย `daily`, `weekly` หรือ `monthly`

@@ -36,6 +36,25 @@ existing OCR result and does not contain an OCR client or make network calls.
 - `plugins/telegram-clarify-pretty`: presentation layer for Telegram clarification buttons.
 - Other accounting skills: confirmation, CRUD, multi-user context, reporting, and conversational policy.
 
+## Scheduled reporting
+
+`skills/accounting/scheduled-project-report/scripts/run_report.py` is the cron
+entrypoint for daily, weekly, and monthly reports. Its reporting module reads
+the frozen `Projects` and `Transactions` schemas through a read-only Sheets
+adapter, calculates all calendar periods in `Asia/Bangkok`, renders Telegram
+text plus the required HTML/PDF artifacts, and coordinates delivery through a
+SQLite ledger stored outside source control. Monthly PDFs are archived beneath
+an environment-configured external root and use an environment-configured
+embedded Thai font.
+
+The ledger identity includes report type, reporting period, Telegram
+destination, artifact/message type, and chunk index. States are
+`pending -> delivering -> delivered`. Telegram has no server-side idempotency
+key, so an item whose external call has started but has an unknown outcome
+remains `delivering` and is not replayed automatically; this prevents duplicate
+chunks or attachments and requires operator reconciliation for that rare
+ambiguous outcome.
+
 ## Trust boundaries
 
 - `LEKZA_RUNTIME_ENV` is mandatory and accepts only `production` or `staging`.
