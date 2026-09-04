@@ -60,10 +60,13 @@ def _production_report_vendor_path():
 def bootstrap_report_vendor_path(environment=None):
     """Expose durable report dependencies without relying on venv startup files."""
     environment = os.environ if environment is None else environment
+    runtime_mode = str(environment.get("LEKZA_RUNTIME_ENV") or "").strip()
+    if runtime_mode not in {"production", "staging"}:
+        return None
     configured = str(environment.get("LEKZA_REPORT_VENDOR_PATH") or "").strip()
     if configured:
         vendor_path = Path(configured)
-    elif str(environment.get("LEKZA_RUNTIME_ENV") or "").strip() == "production":
+    elif runtime_mode == "production":
         vendor_path = _production_report_vendor_path()
         if vendor_path is None:
             return None

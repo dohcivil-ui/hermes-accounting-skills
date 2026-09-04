@@ -279,13 +279,19 @@ class RuntimePathSafetyTests(unittest.TestCase):
             original = list(sys.path)
             try:
                 selected = self.reporting.bootstrap_report_vendor_path(
-                    {"LEKZA_REPORT_VENDOR_PATH": str(vendor)}
+                    {
+                        "LEKZA_RUNTIME_ENV": "production",
+                        "LEKZA_REPORT_VENDOR_PATH": str(vendor),
+                    }
                 )
                 self.assertEqual(selected, vendor)
                 self.assertEqual(sys.path, [str(vendor), *original])
 
                 selected_again = self.reporting.bootstrap_report_vendor_path(
-                    {"LEKZA_REPORT_VENDOR_PATH": str(vendor)}
+                    {
+                        "LEKZA_RUNTIME_ENV": "production",
+                        "LEKZA_REPORT_VENDOR_PATH": str(vendor),
+                    }
                 )
                 self.assertEqual(selected_again, vendor)
                 self.assertEqual(sys.path, [str(vendor), *original])
@@ -305,7 +311,10 @@ class RuntimePathSafetyTests(unittest.TestCase):
             try:
                 with mock.patch.dict(
                     os.environ,
-                    {"LEKZA_REPORT_VENDOR_PATH": str(vendor)},
+                    {
+                        "LEKZA_RUNTIME_ENV": "production",
+                        "LEKZA_REPORT_VENDOR_PATH": str(vendor),
+                    },
                 ):
                     spec = importlib.util.spec_from_file_location(
                         module_name, MODULE_PATH
@@ -317,6 +326,42 @@ class RuntimePathSafetyTests(unittest.TestCase):
             finally:
                 sys.modules.pop(module_name, None)
                 sys.path[:] = original
+
+    def test_explicit_vendor_path_is_available_in_staging(self):
+        with tempfile.TemporaryDirectory() as directory:
+            vendor = Path(directory).resolve() / "vendor"
+            vendor.mkdir()
+            original = list(sys.path)
+            try:
+                selected = self.reporting.bootstrap_report_vendor_path(
+                    {
+                        "LEKZA_RUNTIME_ENV": "staging",
+                        "LEKZA_REPORT_VENDOR_PATH": str(vendor),
+                    }
+                )
+                self.assertEqual(selected, vendor)
+                self.assertEqual(sys.path, [str(vendor), *original])
+            finally:
+                sys.path[:] = original
+
+    def test_explicit_vendor_path_requires_known_runtime_mode(self):
+        with tempfile.TemporaryDirectory() as directory:
+            vendor = Path(directory).resolve() / "vendor"
+            vendor.mkdir()
+            for runtime_mode in (None, "preview"):
+                environment = {"LEKZA_REPORT_VENDOR_PATH": str(vendor)}
+                if runtime_mode is not None:
+                    environment["LEKZA_RUNTIME_ENV"] = runtime_mode
+                original = list(sys.path)
+                try:
+                    with self.subTest(runtime_mode=runtime_mode):
+                        selected = self.reporting.bootstrap_report_vendor_path(
+                            environment
+                        )
+                        self.assertIsNone(selected)
+                        self.assertEqual(sys.path, original)
+                finally:
+                    sys.path[:] = original
 
     def test_vendor_bootstrap_discovers_single_production_vendor_release(self):
         with tempfile.TemporaryDirectory() as directory:
