@@ -257,6 +257,7 @@ class PeriodAndAggregationTests(unittest.TestCase):
 class RuntimePathSafetyTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        cls.reporting = load_module()
         cls.runner = load_runner_module()
 
     def environment(self, external_root):
@@ -267,6 +268,146 @@ class RuntimePathSafetyTests(unittest.TestCase):
             "LEKZA_REPORT_ARCHIVE_ROOT": str(external_root / "archive"),
             "LEKZA_REPORT_THAI_FONT_PATH": str(font),
         }
+
+    def test_vendor_bootstrap_uses_configured_path_once_without_corrupting_sys_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            vendor = Path(directory).resolve() / "vendor"
+            vendor.mkdir()
+            (vendor / "lekza_vendor_probe.py").write_text(
+                "AVAILABLE = True\n", encoding="utf-8"
+            )
+            original = list(sys.path)
+            try:
+                selected = self.reporting.bootstrap_report_vendor_path(
+                    {"LEKZA_REPORT_VENDOR_PATH": str(vendor)}
+                )
+                self.assertEqual(selected, vendor)
+                self.assertEqual(sys.path, [str(vendor), *original])
+
+                selected_again = self.reporting.bootstrap_report_vendor_path(
+                    {"LEKZA_REPORT_VENDOR_PATH": str(vendor)}
+                )
+                self.assertEqual(selected_again, vendor)
+                self.assertEqual(sys.path, [str(vendor), *original])
+
+                probe = importlib.import_module("lekza_vendor_probe")
+                self.assertTrue(probe.AVAILABLE)
+            finally:
+                sys.modules.pop("lekza_vendor_probe", None)
+                sys.path[:] = original
+
+    def test_reporting_module_bootstraps_vendor_path_during_import(self):
+        with tempfile.TemporaryDirectory() as directory:
+            vendor = Path(directory).resolve() / "vendor"
+            vendor.mkdir()
+            original = list(sys.path)
+            module_name = "lekza_scheduled_reporting_bootstrap_test"
+            try:
+                with mock.patch.dict(
+                    os.environ,
+                    {"LEKZA_REPORT_VENDOR_PATH": str(vendor)},
+                ):
+                    spec = importlib.util.spec_from_file_location(
+                        module_name, MODULE_PATH
+                    )
+                    module = importlib.util.module_from_spec(spec)
+                    sys.modules[module_name] = module
+                    spec.loader.exec_module(module)
+                self.assertEqual(sys.path, [str(vendor), *original])
+            finally:
+                sys.modules.pop(module_name, None)
+                sys.path[:] = original
+
+    def test_vendor_bootstrap_discovers_single_production_vendor_release(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data_root = Path(directory).resolve() / "data"
+            vendor = data_root / "lekza-production" / "vendor" / "release-a"
+            (vendor / "reportlab").mkdir(parents=True)
+            original = list(sys.path)
+            try:
+                with mock.patch.object(
+                    self.reporting, "_HOSTINGER_DATA_ROOT", data_root
+                ):
+                    selected = self.reporting.bootstrap_report_vendor_path(
+                        {"LEKZA_RUNTIME_ENV": "production"}
+                    )
+                self.assertEqual(selected, vendor)
+                self.assertEqual(sys.path, [str(vendor), *original])
+            finally:
+                sys.path[:] = original
+
+    def test_staging_does_not_fall_back_to_production_vendor_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data_root = Path(directory).resolve() / "data"
+            vendor = data_root / "lekza-production" / "vendor" / "release-a"
+            (vendor / "reportlab").mkdir(parents=True)
+            original = list(sys.path)
+            with mock.patch.object(
+                self.reporting, "_HOSTINGER_DATA_ROOT", data_root
+            ):
+                selected = self.reporting.bootstrap_report_vendor_path(
+                    {"LEKZA_RUNTIME_ENV": "staging"}
+                )
+            self.assertIsNone(selected)
+            self.assertEqual(sys.path, original)
+
+    def test_production_fallback_rejects_vendor_symlink_escape(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            data_root = root / "data"
+            vendor_root = data_root / "lekza-production" / "vendor"
+            vendor_root.mkdir(parents=True)
+            outside = root / "outside-release"
+            (outside / "reportlab").mkdir(parents=True)
+            try:
+                (vendor_root / "release-link").symlink_to(
+                    outside, target_is_directory=True
+                )
+            except OSError as exc:
+                self.skipTest(f"directory symlinks unavailable: {exc}")
+            original = list(sys.path)
+            with mock.patch.object(
+                self.reporting, "_HOSTINGER_DATA_ROOT", data_root
+            ):
+                selected = self.reporting.bootstrap_report_vendor_path(
+                    {"LEKZA_RUNTIME_ENV": "production"}
+                )
+            self.assertIsNone(selected)
+            self.assertEqual(sys.path, original)
+
+    def test_production_fallback_rejects_vendor_root_symlink_escape(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            data_root = root / "data"
+            production_root = data_root / "lekza-production"
+            production_root.mkdir(parents=True)
+            outside = root / "outside-vendor"
+            (outside / "release-a" / "reportlab").mkdir(parents=True)
+            try:
+                (production_root / "vendor").symlink_to(
+                    outside, target_is_directory=True
+                )
+            except OSError as exc:
+                self.skipTest(f"directory symlinks unavailable: {exc}")
+            original = list(sys.path)
+            with mock.patch.object(
+                self.reporting, "_HOSTINGER_DATA_ROOT", data_root
+            ):
+                selected = self.reporting.bootstrap_report_vendor_path(
+                    {"LEKZA_RUNTIME_ENV": "production"}
+                )
+            self.assertIsNone(selected)
+            self.assertEqual(sys.path, original)
+
+    def test_vendor_bootstrap_ignores_missing_path_and_preserves_sys_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            missing = Path(directory).resolve() / "missing"
+            original = list(sys.path)
+            selected = self.reporting.bootstrap_report_vendor_path(
+                {"LEKZA_REPORT_VENDOR_PATH": str(missing)}
+            )
+            self.assertIsNone(selected)
+            self.assertEqual(sys.path, original)
 
     def test_rejects_repo_root_and_every_repo_subdirectory_for_each_runtime_path(self):
         forbidden = (ROOT, ROOT / "docs", ROOT / "tests", ROOT / "skills", ROOT / "plugins", ROOT / "docs" / "nested")
