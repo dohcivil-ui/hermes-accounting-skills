@@ -60,6 +60,13 @@ remains `delivering` and is not replayed automatically; this prevents duplicate
 chunks or attachments and requires operator reconciliation for that rare
 ambiguous outcome.
 
+Authorized Telegram users can also request a current-month PDF on demand. This
+path reuses the read-only Sheets reader, monthly aggregation, artifact builder,
+and Thai PDF renderer, but bypasses schedule gates and delivers only a transient
+PDF. Its ledger namespace includes the inbound Telegram message identity, so a
+message replay cannot duplicate the PDF or collide with scheduled month-end
+delivery and archive identities.
+
 ## Trust boundaries
 
 - `LEKZA_RUNTIME_ENV` is mandatory and accepts only `production` or `staging`.

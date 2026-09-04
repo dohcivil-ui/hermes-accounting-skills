@@ -28,6 +28,7 @@ in Git:
 - `LEKZA_ACCOUNTING_SPREADSHEET_ID`
 - `LEKZA_REPORT_TELEGRAM_BOT_TOKEN`
 - `LEKZA_REPORT_TELEGRAM_CHAT_ID`
+- `LEKZA_REPORT_TELEGRAM_USER_IDS`: comma-separated Telegram user IDs authorized to request an on-demand PDF
 - Optional `LEKZA_REPORT_TELEGRAM_THREAD_ID`
 - `LEKZA_REPORT_LEDGER_DB`: absolute SQLite path outside the active source boundaries
 - `LEKZA_REPORT_ARCHIVE_ROOT`: absolute monthly-PDF archive root outside the active source boundaries
@@ -40,6 +41,14 @@ boundary. On Hostinger, the runtime source boundaries are `/data/skills` and
 archive, ledger, or font. Persistent production paths beneath
 `/data/lekza-production` are outside those source boundaries and are allowed.
 Restrict the ledger and archive directories to the runtime user.
+
+## On-demand current-month PDF
+
+An authorized user in `LEKZA_REPORT_TELEGRAM_CHAT_ID` may send `/report pdf`
+or `รายงานเดือนนี้ pdf`. The response contains the Bangkok current calendar
+month from day 1 through today. It uses a message-scoped delivery identity and a
+transient PDF, so replaying the same Telegram message is suppressed without
+touching the scheduled month-end PDF archive or delivery identity.
 
 ## Cron schedule
 

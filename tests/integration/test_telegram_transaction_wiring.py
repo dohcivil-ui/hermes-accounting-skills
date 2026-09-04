@@ -737,6 +737,88 @@ class TelegramTransactionWiringTests(unittest.TestCase):
         durable = self.flow.get_transaction(self.record["transaction_id"], **self.actor)
         self.assertEqual(durable["current_state"], "cancelled")
 
+    def test_runtime_patch_routes_english_and_thai_manual_pdf_commands(self):
+        original_calls = []
+        replies = []
+
+        class Adapter:
+            async def _handle_callback_query(self, update, context):
+                return None
+
+            async def _handle_text_message(self, update, context):
+                original_calls.append(update.message.text)
+
+        class Message:
+            def __init__(self, text, message_id, user_id=2002):
+                self.text = text
+                self.message_id = message_id
+                self.chat_id = 1001
+                self.from_user = types.SimpleNamespace(id=user_id)
+
+            async def reply_text(self, text, **kwargs):
+                replies.append(text)
+
+        fake_name = "phase_c_manual_report_adapter"
+        fake_module = types.ModuleType(fake_name)
+        fake_module.TelegramAdapter = Adapter
+        sys.modules[fake_name] = fake_module
+        plugin = load_module("lekza_phase_c_manual_report_plugin", PLUGIN_PATH)
+        self.assertTrue(plugin._patch_module(fake_name))
+        environment = {
+            "LEKZA_RUNTIME_ENV": "production",
+            "LEKZA_REPORT_TELEGRAM_CHAT_ID": "1001",
+            "LEKZA_REPORT_TELEGRAM_USER_IDS": "2002",
+        }
+
+        try:
+            with patch.dict(os.environ, environment, clear=True), patch.object(
+                plugin, "_run_manual_pdf_report"
+            ) as run_report:
+                adapter = Adapter()
+                for message in (
+                    Message("/report pdf", 77),
+                    Message("รายงานเดือนนี้ pdf", 78),
+                ):
+                    asyncio.run(adapter._handle_text_message(
+                        types.SimpleNamespace(message=message), None
+                    ))
+
+                unauthorized = Message("/report pdf", 79, user_id=9999)
+                asyncio.run(adapter._handle_text_message(
+                    types.SimpleNamespace(message=unauthorized), None
+                ))
+        finally:
+            sys.modules.pop(fake_name, None)
+
+        self.assertEqual(
+            [call.args for call in run_report.call_args_list],
+            [("1001", None, "77"), ("1001", None, "78")],
+        )
+        self.assertEqual(original_calls, [])
+        self.assertEqual(replies, ["ไม่มีสิทธิ์ขอรายงานนี้"])
+
+    def test_manual_pdf_authorization_rejects_missing_or_malformed_configuration(self):
+        plugin = load_module("lekza_phase_c_manual_report_auth_plugin", PLUGIN_PATH)
+        base = {
+            "LEKZA_RUNTIME_ENV": "production",
+            "LEKZA_REPORT_TELEGRAM_CHAT_ID": "1001",
+            "LEKZA_REPORT_TELEGRAM_USER_IDS": "2002",
+        }
+        malformed = (
+            ("LEKZA_REPORT_TELEGRAM_CHAT_ID", "not-a-chat"),
+            ("LEKZA_REPORT_TELEGRAM_CHAT_ID", ""),
+            ("LEKZA_REPORT_TELEGRAM_USER_IDS", ""),
+            ("LEKZA_REPORT_TELEGRAM_USER_IDS", "2002,"),
+            ("LEKZA_REPORT_TELEGRAM_USER_IDS", "2002,,2003"),
+            ("LEKZA_REPORT_TELEGRAM_USER_IDS", "2002,not-a-user"),
+            ("LEKZA_REPORT_TELEGRAM_USER_IDS", "2002,2002"),
+        )
+        for name, value in malformed:
+            environment = dict(base)
+            environment[name] = value
+            with self.subTest(name=name, value=value), self.assertRaises(ValueError):
+                plugin._validate_report_actor("1001", "2002", environment)
+
     def test_runtime_patch_consumes_pending_reference_from_effective_message(self):
         pending = self.controller.begin_from_ocr(
             tenant_id="1001",

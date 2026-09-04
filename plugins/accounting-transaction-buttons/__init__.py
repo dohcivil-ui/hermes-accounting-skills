@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timezone
 import gc
 import importlib.util
 import json
@@ -20,6 +21,7 @@ _CONTROLLER_LOCK = threading.Lock()
 _MODULE_CACHE = {}
 _LOG = logging.getLogger("lekza.accounting_transaction_buttons")
 _STARTUP_REBIND_TIMEOUT_SECONDS = 30.0
+_MANUAL_PDF_COMMANDS = frozenset({"/report pdf", "รายงานเดือนนี้ pdf"})
 
 
 class AdapterCompatibilityError(RuntimeError):
@@ -101,6 +103,91 @@ def _validate_staging_actor(chat_id, telegram_user_id):
     runtime_mode = guard.validate_runtime_environment()
     if runtime_mode == "staging":
         guard.validate_staging_actor(str(chat_id), str(telegram_user_id))
+
+
+def _is_manual_pdf_command(text):
+    return " ".join(str(text or "").strip().casefold().split()) in _MANUAL_PDF_COMMANDS
+
+
+def _configured_telegram_id(value, name, *, allow_negative=False):
+    identifier = str(value or "").strip()
+    digits = (
+        identifier[1:]
+        if allow_negative and identifier.startswith("-")
+        else identifier
+    )
+    if (
+        not digits
+        or not digits.isascii()
+        or not digits.isdecimal()
+        or int(identifier) == 0
+        or str(int(identifier)) != identifier
+    ):
+        raise ValueError(f"{name} must be a canonical Telegram identifier")
+    return identifier
+
+
+def _validate_report_actor(chat_id, telegram_user_id, environment=None):
+    environment = os.environ if environment is None else environment
+    configured_chat = _configured_telegram_id(
+        environment.get("LEKZA_REPORT_TELEGRAM_CHAT_ID"),
+        "LEKZA_REPORT_TELEGRAM_CHAT_ID",
+        allow_negative=True,
+    )
+    raw_users = str(
+        environment.get("LEKZA_REPORT_TELEGRAM_USER_IDS") or ""
+    ).strip()
+    user_items = [item.strip() for item in raw_users.split(",")]
+    if not raw_users:
+        raise ValueError("LEKZA_REPORT_TELEGRAM_USER_IDS is required")
+    if any(not item for item in user_items):
+        raise ValueError("LEKZA_REPORT_TELEGRAM_USER_IDS must be valid CSV")
+    allowed_users = {
+        _configured_telegram_id(item, "LEKZA_REPORT_TELEGRAM_USER_IDS")
+        for item in user_items
+    }
+    if len(allowed_users) != len(user_items):
+        raise ValueError(
+            "LEKZA_REPORT_TELEGRAM_USER_IDS must not contain duplicates"
+        )
+    if (
+        str(chat_id) != configured_chat
+        or str(telegram_user_id) not in allowed_users
+    ):
+        raise PermissionError("Telegram actor is not authorized for manual reporting")
+    _validate_staging_actor(chat_id, telegram_user_id)
+    return True
+
+
+def _reporting_scripts_path():
+    return (
+        Path(__file__).resolve().parents[2]
+        / "skills/accounting/scheduled-project-report/scripts"
+    )
+
+
+def _manual_report_runner(chat_id, thread_id):
+    scripts = _reporting_scripts_path()
+    _load_runtime_module("scheduled_reporting", scripts / "scheduled_reporting.py")
+    runner_module = _load_runtime_module(
+        "lekza_manual_report_runner", scripts / "run_report.py"
+    )
+    return runner_module.build_runner(
+        os.environ,
+        destination_chat_id=str(chat_id),
+        destination_thread_id=thread_id,
+    )
+
+
+def _run_manual_pdf_report(chat_id, thread_id, message_id):
+    runner, artifacts = _manual_report_runner(chat_id, thread_id)
+    try:
+        return runner.run_current_month_pdf(
+            datetime.now(timezone.utc),
+            f"telegram-message:{message_id}",
+        )
+    finally:
+        artifacts.close()
 
 
 def _validate_adapter_class(adapter_cls):
@@ -203,6 +290,9 @@ def _patch_module(mod_name, *, strict=False):
         if from_user is None:
             from_user = getattr(update, "effective_user", None)
         user_id_value = getattr(from_user, "id", None)
+        message_id_value = getattr(message, "message_id", None)
+        if message_id_value is None:
+            message_id_value = getattr(update, "update_id", None)
         _LOG.info("Lekza text handler entered")
         _LOG.info(
             "Lekza text extraction message_present=%s chat_present=%s "
@@ -213,6 +303,34 @@ def _patch_module(mod_name, *, strict=False):
             bool(text),
         )
         if text:
+            if _is_manual_pdf_command(text):
+                reply = getattr(message, "reply_text", None)
+                try:
+                    chat_id = str(chat_id_value or "")
+                    user_id = str(user_id_value or "")
+                    _validate_report_actor(chat_id, user_id)
+                    if message_id_value in (None, ""):
+                        raise ValueError("Telegram manual report requires a message identity")
+                    await asyncio.to_thread(
+                        _run_manual_pdf_report,
+                        chat_id,
+                        getattr(message, "message_thread_id", None),
+                        str(message_id_value),
+                    )
+                except PermissionError:
+                    if reply is not None:
+                        await reply("ไม่มีสิทธิ์ขอรายงานนี้")
+                except Exception as exc:
+                    error_type = type(exc).__name__
+                    if not error_type.isidentifier():
+                        error_type = "Exception"
+                    _LOG.warning(
+                        "Lekza manual PDF report failed error_type=%s",
+                        error_type[:80],
+                    )
+                    if reply is not None:
+                        await reply("ไม่สามารถสร้างรายงาน PDF ได้ กรุณาลองใหม่")
+                return
             try:
                 chat_id = str(chat_id_value or "")
                 user_id = str(user_id_value or "")

@@ -12,6 +12,7 @@ from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from html import escape
+import hashlib
 import os
 from pathlib import Path
 import sqlite3
@@ -158,6 +159,12 @@ def reporting_period(report_type, now):
         start = today.replace(day=1)
         key = today.strftime("%Y-%m")
     return ReportingPeriod(report_type, start, today, key)
+
+
+def current_month_period(now):
+    """Return day one through today in the Bangkok calendar month."""
+    today = _bangkok_date(now)
+    return ReportingPeriod("monthly", today.replace(day=1), today, today.strftime("%Y-%m"))
 
 
 def ensure_schedule_due(report_type, now):
@@ -511,6 +518,34 @@ class ArtifactBuilder:
             temporary.unlink(missing_ok=True)
         return target
 
+    def build_manual_monthly_pdf(self, report, request_identity):
+        """Build a transient monthly PDF without touching the scheduled archive."""
+        if report.report_type != "monthly":
+            raise ValueError("Only monthly reports can be rendered as PDF")
+        identity = str(request_identity or "").strip()
+        if not identity:
+            raise ValueError("Manual report request identity is required")
+        digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16]
+        target = Path(self._transient.name) / (
+            f"manual-project-report-{report.period.key}-{digest}.pdf"
+        )
+        if target.is_file():
+            return target
+        with tempfile.NamedTemporaryFile(
+            prefix=".manual-project-report-",
+            suffix=".pdf",
+            dir=self._transient.name,
+            delete=False,
+        ) as handle:
+            temporary = Path(handle.name)
+        try:
+            self._write_pdf(report, temporary)
+            os.replace(temporary, target)
+        finally:
+            if temporary.exists():
+                temporary.unlink()
+        return target
+
     def _write_pdf(self, report, output_path):
         try:
             from reportlab.lib import colors
@@ -823,9 +858,14 @@ class ReportRunner:
         self._destination = str(destination)
         self._telegram_limit = int(telegram_limit)
 
-    def _deliver(self, report, artifact_type, chunk_index, callback):
+    def _deliver(
+        self, report, artifact_type, chunk_index, callback, *,
+        identity_report_type=None, identity_period_key=None,
+    ):
         key = self._ledger.ensure(
-            report.report_type, report.period.key, self._destination,
+            identity_report_type or report.report_type,
+            identity_period_key or report.period.key,
+            self._destination,
             artifact_type, chunk_index,
         )
         claim = self._ledger.claim(key)
@@ -843,6 +883,27 @@ class ReportRunner:
             raise AmbiguousDeliveryError("Delivery outcome is uncertain; automatic retry suppressed") from exc
         self._ledger.mark_delivered(claim, external_id)
         return True
+
+    def run_current_month_pdf(self, now, request_identity):
+        """Generate and deliver only the current-month PDF for one Telegram request."""
+        identity = str(request_identity or "").strip()
+        if not identity:
+            raise ValueError("Manual report request identity is required")
+        period = current_month_period(now)
+        projects, transactions = self._reader.read()
+        report = aggregate_report("monthly", period, projects, transactions)
+        pdf_path = self._artifacts.build_manual_monthly_pdf(report, identity)
+        sent = self._deliver(
+            report,
+            "pdf_attachment",
+            0,
+            lambda: self._sender.send_document(
+                self._destination, pdf_path, f"PDF report {period.key}"
+            ),
+            identity_report_type="manual_monthly_pdf",
+            identity_period_key=identity,
+        )
+        return RunResult("manual_monthly_pdf", period.key, int(sent), int(not sent))
 
     def run(self, report_type, now):
         period = ensure_schedule_due(report_type, now)

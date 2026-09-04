@@ -69,6 +69,14 @@ class PeriodAndAggregationTests(unittest.TestCase):
                 "monthly", datetime(2028, 2, 28, 14, 20, tzinfo=timezone.utc)
             )
 
+    def test_manual_current_month_period_uses_bangkok_day_one_through_today(self):
+        period = self.reporting.current_month_period(
+            datetime(2026, 9, 4, 20, 30, tzinfo=timezone.utc)
+        )
+        self.assertEqual(period.report_type, "monthly")
+        self.assertEqual((str(period.start), str(period.end)), ("2026-09-01", "2026-09-05"))
+        self.assertEqual(period.key, "2026-09")
+
     def test_weekly_requires_sunday_in_bangkok(self):
         with self.assertRaises(self.reporting.ScheduleGateError):
             self.reporting.reporting_period(
@@ -236,6 +244,12 @@ class PeriodAndAggregationTests(unittest.TestCase):
                 self.assertTrue(pdf_path.is_relative_to(Path(directory) / "archive"))
                 os.utime(pdf_path, (1, 1))
                 self.assertEqual(builder.build_monthly_pdf(report).stat().st_mtime, 1)
+                manual_pdf = builder.build_manual_monthly_pdf(
+                    report, "telegram-message:77"
+                )
+                self.assertTrue(manual_pdf.read_bytes().startswith(b"%PDF-"))
+                self.assertFalse(manual_pdf.is_relative_to(Path(directory) / "archive"))
+                self.assertEqual(pdf_path.stat().st_mtime, 1)
             finally:
                 builder.close()
 
