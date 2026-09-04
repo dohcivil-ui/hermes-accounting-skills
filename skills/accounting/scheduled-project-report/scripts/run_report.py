@@ -21,6 +21,7 @@ from scheduled_reporting import (
 
 
 _HOSTINGER_DATA_ROOT = Path("/data")
+_CONFIGURED_DESTINATION = object()
 
 
 def _required(environment, name):
@@ -88,7 +89,10 @@ def _load_google_module(plugin_root):
     return module
 
 
-def build_runner(environment=None):
+def build_runner(
+    environment=None, *, destination_chat_id=None,
+    destination_thread_id=_CONFIGURED_DESTINATION,
+):
     environment = os.environ if environment is None else environment
     runtime_mode = _required(environment, "LEKZA_RUNTIME_ENV")
     if runtime_mode not in {"production", "staging"}:
@@ -106,8 +110,15 @@ def build_runner(environment=None):
     )
     sender = TelegramSender(
         _required(environment, "LEKZA_REPORT_TELEGRAM_BOT_TOKEN"),
-        _required(environment, "LEKZA_REPORT_TELEGRAM_CHAT_ID"),
-        thread_id=environment.get("LEKZA_REPORT_TELEGRAM_THREAD_ID"),
+        (
+            _required(environment, "LEKZA_REPORT_TELEGRAM_CHAT_ID")
+            if destination_chat_id is None else str(destination_chat_id)
+        ),
+        thread_id=(
+            environment.get("LEKZA_REPORT_TELEGRAM_THREAD_ID")
+            if destination_thread_id is _CONFIGURED_DESTINATION
+            else destination_thread_id
+        ),
     )
     artifacts = ArtifactBuilder(runtime_paths["archive"], runtime_paths["font"])
     runner = ReportRunner(

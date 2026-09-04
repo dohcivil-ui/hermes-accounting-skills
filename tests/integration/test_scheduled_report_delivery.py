@@ -98,6 +98,11 @@ class FakeArtifacts:
         path.write_bytes(b"%PDF-1.4 synthetic")
         return path
 
+    def build_manual_monthly_pdf(self, report, request_identity):
+        path = self.root / f"manual-{report.period.key}.pdf"
+        path.write_bytes(b"%PDF-1.4 synthetic manual")
+        return path
+
 
 reporting = load_module()
 
@@ -244,6 +249,26 @@ class ReportRunnerDeliveryTests(unittest.TestCase):
         self.runner().run("monthly", now)
         self.assertEqual([item[0] for item in self.sender.sent], ["text", "document", "document"])
         self.assertEqual([item[2] for item in self.sender.sent[1:]], [".html", ".pdf"])
+
+    def test_manual_pdf_replay_is_suppressed_without_colliding_with_month_end(self):
+        manual_now = datetime(2026, 9, 30, 16, 59, tzinfo=timezone.utc)
+        first = self.runner().run_current_month_pdf(manual_now, "telegram-message:77")
+        replay = self.runner().run_current_month_pdf(
+            datetime(2026, 9, 30, 17, 1, tzinfo=timezone.utc),
+            "telegram-message:77",
+        )
+
+        self.assertEqual((first.delivered, replay.delivered), (1, 0))
+        self.assertEqual((first.period_key, replay.period_key), ("2026-09", "2026-10"))
+        self.assertEqual([item[0] for item in self.sender.sent], ["document"])
+
+        scheduled_now = datetime(2026, 9, 30, 14, 20, tzinfo=timezone.utc)
+        scheduled = self.runner().run("monthly", scheduled_now)
+        self.assertEqual(scheduled.delivered, 3)
+        self.assertEqual(
+            [item[0] for item in self.sender.sent],
+            ["document", "text", "document", "document"],
+        )
 
     def test_definitive_failure_returns_item_to_pending_for_retry(self):
         now = datetime(2026, 9, 3, 14, 0, tzinfo=timezone.utc)
