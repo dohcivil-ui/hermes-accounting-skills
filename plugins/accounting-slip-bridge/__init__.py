@@ -56,6 +56,15 @@ _REFERENCE_TEXT_PATTERNS = (
         r"([A-Za-z0-9][A-Za-z0-9._/-]{2,127})"
     ),
 )
+_THAI_AMOUNT_LABEL_PATTERN = "|".join(
+    re.escape(unicodedata.normalize("NFKC", label))
+    for label in ("จำนวนเงิน", "ยอดเงิน")
+)
+_AMOUNT_TEXT_PATTERN = re.compile(
+    rf"(?im)(?:\bamount\b|{_THAI_AMOUNT_LABEL_PATTERN})\s*[:：]?\s*"
+    r"(?:THB\s*|฿\s*)?"
+    r"((?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?)(?![\w.,])"
+)
 
 
 def _sanitized_error_message(exc):
@@ -123,6 +132,28 @@ def _reference_from_text(ocr_result):
     return None
 
 
+def _amount_from_text(ocr_result):
+    texts = [ocr_result.get("raw_ocr_text"), ocr_result.get("text")]
+    raw_response = ocr_result.get("raw_response")
+    if isinstance(raw_response, dict):
+        texts.extend((raw_response.get("text"), raw_response.get("raw_ocr_text")))
+        pages = raw_response.get("pages")
+        if isinstance(pages, list):
+            texts.extend(
+                page.get("markdown") for page in pages if isinstance(page, dict)
+            )
+    for text in texts:
+        if not isinstance(text, str):
+            continue
+        normalized_text = unicodedata.normalize("NFKC", text)
+        normalized_text = _MARKDOWN_EMPHASIS_OPEN_PATTERN.sub("", normalized_text)
+        normalized_text = _MARKDOWN_EMPHASIS_CLOSE_PATTERN.sub("", normalized_text)
+        match = _AMOUNT_TEXT_PATTERN.search(normalized_text)
+        if match:
+            return match.group(1)
+    return None
+
+
 def _normalize_ocr_result_for_handoff(ocr_result):
     if not isinstance(ocr_result, dict):
         raise ValueError("OCR result must be a mapping")
@@ -149,6 +180,19 @@ def _normalize_ocr_result_for_handoff(ocr_result):
         reference = _reference_from_text(ocr_result)
     if reference is not None:
         parsed["reference_no"] = reference
+    amount = parsed.get("amount")
+    if amount is None and isinstance(raw_response, dict):
+        for candidate in (
+            raw_response.get("parsed"),
+            raw_response.get("data"),
+        ):
+            if isinstance(candidate, dict) and candidate.get("amount") is not None:
+                amount = candidate["amount"]
+                break
+    if amount is None:
+        amount = _amount_from_text(ocr_result)
+    if amount is not None:
+        parsed["amount"] = amount
     normalized["parsed"] = parsed
     return normalized
 

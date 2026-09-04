@@ -166,10 +166,6 @@ class PhaseDOcrHandoffRegressionTests(unittest.TestCase):
         self.assertTrue(supplied["ok"])
         prompt = supplied["prompt"]
         self.assertEqual(prompt["current_state"], "waiting_project")
-        self.assertIn("ยอดเงิน", prompt["text"])
-        supplied_amount = self.controller.handle_manual_message("1.00", **actor)
-        self.assertTrue(supplied_amount["ok"])
-        prompt = supplied_amount["prompt"]
 
         second = self.controller.begin_from_ocr(
             tenant_id="phase-d-missing-reference-tenant",
@@ -232,6 +228,7 @@ class PhaseDOcrHandoffRegressionTests(unittest.TestCase):
         )
         normalized = self.bridge._normalize_ocr_result_for_handoff(ocr_result)
         self.assertEqual(normalized["parsed"]["reference_no"], REFERENCE_NO)
+        self.assertEqual(normalized["parsed"]["amount"], "1.00")
 
         tenant_id = "phase-d-real-shape-tenant"
         created = self.controller.begin_from_ocr(
@@ -247,6 +244,131 @@ class PhaseDOcrHandoffRegressionTests(unittest.TestCase):
         durable = self.store.get_by_reference(tenant_id, REFERENCE_NO)
         self.assertEqual(created["transaction_id"], durable["transaction_id"])
         self.assertEqual(durable["reference_no"], REFERENCE_NO)
+        self.assertEqual(durable["ocr_fields"]["amount"], 1)
+        self.assertFalse(durable["needs_amount"])
+
+    def test_amount_normalization_priority_and_requires_label(self):
+        cases = (
+            (
+                "parsed",
+                {
+                    "parsed": {"amount": "4.00"},
+                    "raw_response": {
+                        "parsed": {"amount": "3.00"},
+                        "data": {"amount": "2.00"},
+                    },
+                    "raw_ocr_text": "Amount: 1.00",
+                },
+                "4.00",
+            ),
+            (
+                "raw_response.parsed",
+                {
+                    "parsed": {},
+                    "raw_response": {
+                        "parsed": {"amount": "3.00"},
+                        "data": {"amount": "2.00"},
+                    },
+                    "raw_ocr_text": "Amount: 1.00",
+                },
+                "3.00",
+            ),
+            (
+                "raw_response.data",
+                {
+                    "parsed": {},
+                    "raw_response": {
+                        "parsed": {},
+                        "data": {"amount": "2.00"},
+                    },
+                    "raw_ocr_text": "Amount: 1.00",
+                },
+                "2.00",
+            ),
+            (
+                "english_markdown",
+                {"parsed": {}, "raw_ocr_text": "Amount: 1.00"},
+                "1.00",
+            ),
+            (
+                "english_markdown_with_grouping",
+                {"parsed": {}, "raw_ocr_text": "Amount: 1,234.56"},
+                "1,234.56",
+            ),
+            (
+                "thai_amount_markdown",
+                {"parsed": {}, "raw_ocr_text": "จำนวนเงิน: 1.00 บาท"},
+                "1.00",
+            ),
+            (
+                "thai_total_markdown",
+                {"parsed": {}, "raw_ocr_text": "ยอดเงิน: 1.00 บาท"},
+                "1.00",
+            ),
+            (
+                "unlabeled_number",
+                {"parsed": {}, "raw_ocr_text": "20260901.01\n1.00"},
+                None,
+            ),
+            (
+                "malformed_grouping",
+                {"parsed": {}, "raw_ocr_text": "Amount: 1,23"},
+                None,
+            ),
+            (
+                "malformed_decimal",
+                {"parsed": {}, "raw_ocr_text": "Amount: 1.2.3"},
+                None,
+            ),
+            (
+                "malformed_suffix",
+                {"parsed": {}, "raw_ocr_text": "Amount: 1.00abc"},
+                None,
+            ),
+        )
+        for name, ocr_result, expected in cases:
+            with self.subTest(name=name):
+                normalized = self.bridge._normalize_ocr_result_for_handoff(
+                    ocr_result
+                )
+                if expected is None:
+                    self.assertNotIn("amount", normalized["parsed"])
+                else:
+                    self.assertEqual(normalized["parsed"]["amount"], expected)
+
+    def test_existing_handoff_is_idempotent_and_does_not_enrich_ocr_fields(self):
+        tenant_id = "phase-d-idempotent-tenant"
+        handoff = {
+            "tenant_id": tenant_id,
+            "chat_id": "phase-d-synthetic-chat",
+            "thread_id": None,
+            "session_id": "phase-d-idempotent-session",
+            "handoff_id": "phase-d-idempotent-message",
+            "telegram_user_id": "phase-d-synthetic-user",
+            "source_image_path": self.slip,
+        }
+        created = self.controller.begin_from_ocr(
+            **handoff,
+            ocr_result={"parsed": {"reference_no": REFERENCE_NO}},
+        )
+        original = self.store.get_by_reference(tenant_id, REFERENCE_NO)
+        self.assertTrue(original["needs_amount"])
+        self.assertNotIn("amount", original["ocr_fields"])
+
+        replayed = self.controller.begin_from_ocr(
+            **handoff,
+            ocr_result={
+                "parsed": {
+                    "reference_no": REFERENCE_NO,
+                    "amount": "99.00",
+                }
+            },
+        )
+
+        durable = self.store.get_by_reference(tenant_id, REFERENCE_NO)
+        self.assertEqual(replayed["transaction_id"], created["transaction_id"])
+        self.assertTrue(durable["needs_amount"])
+        self.assertNotIn("amount", durable["ocr_fields"])
 
     def test_telegram_hook_preserves_real_shape_before_normalization(self):
         api_response = self.real_shape_fixture()
