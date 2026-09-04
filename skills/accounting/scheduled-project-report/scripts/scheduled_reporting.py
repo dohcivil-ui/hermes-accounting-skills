@@ -16,12 +16,76 @@ import hashlib
 import os
 from pathlib import Path
 import sqlite3
+import sys
 import tempfile
 import time
 import urllib.parse
 import uuid
 from zoneinfo import ZoneInfo
 
+
+_HOSTINGER_DATA_ROOT = Path("/data")
+
+
+def _production_report_vendor_path():
+    try:
+        production_root = (
+            _HOSTINGER_DATA_ROOT / "lekza-production"
+        ).resolve()
+        vendor_root = (production_root / "vendor").resolve()
+    except OSError:
+        return None
+    if (
+        not vendor_root.is_relative_to(production_root)
+        or not vendor_root.is_dir()
+    ):
+        return None
+    candidates = []
+    try:
+        paths = vendor_root.iterdir()
+        for path in paths:
+            candidate = path.resolve()
+            reportlab_path = (candidate / "reportlab").resolve()
+            if (
+                candidate.is_relative_to(vendor_root)
+                and reportlab_path.is_relative_to(candidate)
+                and reportlab_path.is_dir()
+            ):
+                candidates.append(candidate)
+    except OSError:
+        return None
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def bootstrap_report_vendor_path(environment=None):
+    """Expose durable report dependencies without relying on venv startup files."""
+    environment = os.environ if environment is None else environment
+    runtime_mode = str(environment.get("LEKZA_RUNTIME_ENV") or "").strip()
+    if runtime_mode not in {"production", "staging"}:
+        return None
+    configured = str(environment.get("LEKZA_REPORT_VENDOR_PATH") or "").strip()
+    if configured:
+        vendor_path = Path(configured)
+    elif runtime_mode == "production":
+        vendor_path = _production_report_vendor_path()
+        if vendor_path is None:
+            return None
+    else:
+        return None
+    if not vendor_path.is_absolute():
+        raise ValueError("LEKZA_REPORT_VENDOR_PATH must be an absolute path")
+    vendor_path = vendor_path.resolve()
+    if not vendor_path.is_dir():
+        return None
+    if not any(
+        entry and Path(entry).resolve() == vendor_path
+        for entry in sys.path
+    ):
+        sys.path.insert(0, str(vendor_path))
+    return vendor_path
+
+
+bootstrap_report_vendor_path()
 
 BANGKOK = ZoneInfo("Asia/Bangkok")
 REPORT_TYPES = frozenset({"daily", "weekly", "monthly"})
