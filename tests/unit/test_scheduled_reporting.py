@@ -449,7 +449,10 @@ class RuntimePathSafetyTests(unittest.TestCase):
             missing = Path(directory).resolve() / "missing"
             original = list(sys.path)
             selected = self.reporting.bootstrap_report_vendor_path(
-                {"LEKZA_REPORT_VENDOR_PATH": str(missing)}
+                {
+                    "LEKZA_RUNTIME_ENV": "production",
+                    "LEKZA_REPORT_VENDOR_PATH": str(missing),
+                }
             )
             self.assertIsNone(selected)
             self.assertEqual(sys.path, original)
