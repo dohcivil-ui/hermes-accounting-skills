@@ -11,6 +11,7 @@ from unittest.mock import mock_open, patch
 
 ROOT = Path(__file__).resolve().parents[2]
 BRIDGE_PATH = ROOT / "plugins/accounting-slip-bridge/__init__.py"
+INGRESS_PATH = ROOT / "plugins/accounting-slip-bridge/ocr_ingress.py"
 FLOW_PATH = ROOT / "plugins/accounting-slip-bridge/transaction_flow.py"
 WIRING_PATH = ROOT / "plugins/accounting-slip-bridge/telegram_wiring.py"
 FIXTURE_PATH = ROOT / "tests/fixtures/phase_d_aksonocr_handoff.json"
@@ -341,6 +342,244 @@ class PhaseDOcrHandoffRegressionTests(unittest.TestCase):
                     self.assertNotIn("amount", normalized["parsed"])
                 else:
                     self.assertEqual(normalized["parsed"]["amount"], expected)
+
+    def test_invalid_or_ambiguous_ocr_date_keeps_manual_date_fallback(self):
+        cases = (
+            (
+                "invalid",
+                {"parsed": {
+                    "reference_no": "DATE-INVALID",
+                    "amount": "1.00",
+                    "date": "31/02/2569",
+                }},
+            ),
+            (
+                "ambiguous",
+                {
+                    "parsed": {
+                        "reference_no": "DATE-AMBIGUOUS",
+                        "amount": "1.00",
+                        "date": "05/09/2026",
+                    },
+                    "raw_response": {
+                        "data": {"date": "06/09/2026"}
+                    },
+                },
+            ),
+        )
+        for name, ocr_result in cases:
+            with self.subTest(name=name):
+                normalized = self.bridge._normalize_ocr_result_for_handoff(
+                    ocr_result
+                )
+                created = self.controller.begin_from_ocr(
+                    tenant_id=f"phase-d-date-{name}-tenant",
+                    chat_id="phase-d-synthetic-chat",
+                    thread_id=None,
+                    session_id=f"phase-d-date-{name}-session",
+                    handoff_id=f"phase-d-date-{name}-message",
+                    telegram_user_id="phase-d-synthetic-user",
+                    source_image_path=self.slip,
+                    ocr_result=normalized,
+                )
+                durable = self.flow.get_transaction(
+                    created["transaction_id"],
+                    platform="telegram",
+                    chat_id="phase-d-synthetic-chat",
+                    telegram_user_id="phase-d-synthetic-user",
+                )
+                self.assertEqual(durable["entry_mode"], "date")
+                self.assertNotIn("date", durable["ocr_fields"])
+
+    def test_invalid_date_key_extraction_keeps_manual_date_fallback(self):
+        for index, extracted_date in enumerate(("05/09/69", "31/02/2569")):
+            with self.subTest(extracted_date=extracted_date), patch.object(
+                self.bridge,
+                "call_akson_date_extraction",
+                return_value=extracted_date,
+            ):
+                normalized = self.bridge._normalize_ocr_result_for_handoff({
+                    "parsed": {
+                        "reference_no": f"DATE-EXTRACTED-INVALID-{index}",
+                        "amount": "1.00",
+                    }
+                })
+                self.bridge._add_extracted_date(normalized, self.slip)
+                created = self.controller.begin_from_ocr(
+                    tenant_id=f"phase-d-extracted-date-{index}-tenant",
+                    chat_id="phase-d-synthetic-chat",
+                    thread_id=None,
+                    session_id=f"phase-d-extracted-date-{index}-session",
+                    handoff_id=f"phase-d-extracted-date-{index}-message",
+                    telegram_user_id="phase-d-synthetic-user",
+                    source_image_path=self.slip,
+                    ocr_result=normalized,
+                )
+                durable = self.flow.get_transaction(
+                    created["transaction_id"],
+                    platform="telegram",
+                    chat_id="phase-d-synthetic-chat",
+                    telegram_user_id="phase-d-synthetic-user",
+                )
+                self.assertEqual(durable["entry_mode"], "date")
+                self.assertNotIn("date", durable["ocr_fields"])
+
+    def test_ambiguous_date_persists_across_crash_without_reextraction(self):
+        crash_before_handoff = {"value": True}
+        handed_off = []
+        ingress_module = load_module(
+            "lekza_phase_d_ambiguous_ingress", INGRESS_PATH
+        )
+        ingress_ledger = ingress_module.OcrIngressLedger(
+            self.root / "ambiguous-ingress.sqlite3"
+        )
+        ingress_identity = {
+            "tenant_id": "phase-d-ambiguous-resume-tenant",
+            "message_identity": "phase-d-ambiguous-resume-message",
+        }
+
+        def lookup(*args):
+            return ingress_ledger.lookup_message(**ingress_identity)
+
+        def obtain(*args, **kwargs):
+            return ingress_ledger.obtain(
+                **ingress_identity,
+                source_image_path=kwargs["source_image_path"],
+                ocr_reader=kwargs["ocr_reader"],
+            )
+
+        def find_candidates(outcome):
+            if crash_before_handoff["value"]:
+                crash_before_handoff["value"] = False
+                raise RuntimeError("synthetic crash before handoff")
+            return []
+
+        def handoff_ocr_result(
+            event, gateway, session_store, *, source_image_path, ocr_result
+        ):
+            transaction = self.controller.begin_from_ocr(
+                tenant_id="phase-d-ambiguous-resume-tenant",
+                chat_id="phase-d-synthetic-chat",
+                thread_id=None,
+                session_id="phase-d-ambiguous-resume-session",
+                handoff_id="phase-d-ambiguous-resume-message",
+                telegram_user_id="phase-d-synthetic-user",
+                source_image_path=source_image_path,
+                ocr_result=ocr_result,
+            )
+            handed_off.append(transaction["transaction_id"])
+            return {"transaction": transaction}
+
+        buttons = types.SimpleNamespace(
+            lookup_ocr_ingress=lookup,
+            obtain_ocr_ingress=obtain,
+            find_ocr_duplicate_candidates=find_candidates,
+            complete_ocr_ingress=lambda outcome, transaction_id: (
+                ingress_ledger.complete(
+                    outcome, transaction_id=transaction_id
+                )
+            ),
+            handoff_ocr_result=handoff_ocr_result,
+        )
+        event = types.SimpleNamespace(
+            source=types.SimpleNamespace(
+                platform="telegram",
+                chat_id="phase-d-synthetic-chat",
+                user_id="phase-d-synthetic-user",
+            ),
+            media_urls=[str(self.slip)],
+            media_types=["image/jpeg"],
+            message_id="phase-d-ambiguous-resume-message",
+        )
+
+        first_context = types.SimpleNamespace(hooks={})
+        first_context.register_hook = (
+            lambda name, callback: first_context.hooks.__setitem__(name, callback)
+        )
+        self.bridge.register(first_context)
+        with patch.dict(
+            os.environ, {"LEKZA_RUNTIME_ENV": "production"}, clear=True
+        ), patch.dict(
+            sys.modules, {"lekza_accounting_transaction_buttons": buttons}
+        ), patch.object(
+            self.bridge, "_materialize_media", return_value=str(self.slip)
+        ), patch.object(
+            self.bridge,
+            "call_akson_ocr",
+            return_value={
+                "akson_called": True,
+                "confidence": 1.0,
+                "parsed": {
+                    "reference_no": "DATE-AMBIGUOUS-RESUME",
+                    "amount": "1.00",
+                    "date": "05/09/2026",
+                },
+                "raw_response": {"data": {"date": "06/09/2026"}},
+            },
+        ), patch.object(
+            self.bridge, "call_akson_date_extraction"
+        ) as first_extraction, patch.object(
+            self.bridge.os, "makedirs"
+        ), patch(
+            "builtins.open", mock_open()
+        ):
+            first_context.hooks["pre_gateway_dispatch"](event)
+        first_extraction.assert_not_called()
+
+        connection = ingress_ledger._connect()
+        try:
+            persisted_date = json.loads(connection.execute(
+                "SELECT ocr_result_json FROM ocr_ingress"
+            ).fetchone()["ocr_result_json"])["parsed"]["date"]
+            self.assertEqual(
+                persisted_date, self.bridge._AMBIGUOUS_STRUCTURED_DATE
+            )
+            with connection:
+                connection.execute(
+                    "UPDATE ocr_ingress SET claim_expires_at = ?",
+                    ("2000-01-01T00:00:00+00:00",),
+                )
+        finally:
+            connection.close()
+
+        restarted_bridge = load_module(
+            "lekza_phase_d_ambiguous_restart_bridge", BRIDGE_PATH
+        )
+        restarted_context = types.SimpleNamespace(hooks={})
+        restarted_context.register_hook = (
+            lambda name, callback: restarted_context.hooks.__setitem__(
+                name, callback
+            )
+        )
+        restarted_bridge.register(restarted_context)
+        with patch.dict(
+            os.environ, {"LEKZA_RUNTIME_ENV": "production"}, clear=True
+        ), patch.dict(
+            sys.modules, {"lekza_accounting_transaction_buttons": buttons}
+        ), patch.object(
+            restarted_bridge, "_materialize_media", return_value=str(self.slip)
+        ), patch.object(
+            restarted_bridge, "call_akson_ocr"
+        ) as restarted_ocr, patch.object(
+            restarted_bridge, "call_akson_date_extraction"
+        ) as restarted_extraction, patch.object(
+            restarted_bridge.os, "makedirs"
+        ), patch(
+            "builtins.open", mock_open()
+        ):
+            result = restarted_context.hooks["pre_gateway_dispatch"](event)
+
+        self.assertEqual(result, {"action": "skip"})
+        restarted_ocr.assert_not_called()
+        restarted_extraction.assert_not_called()
+        durable = self.flow.get_transaction(
+            handed_off[0],
+            platform="telegram",
+            chat_id="phase-d-synthetic-chat",
+            telegram_user_id="phase-d-synthetic-user",
+        )
+        self.assertEqual(durable["entry_mode"], "date")
+        self.assertNotIn("date", durable["ocr_fields"])
 
     def test_existing_handoff_is_idempotent_and_does_not_enrich_ocr_fields(self):
         tenant_id = "phase-d-idempotent-tenant"

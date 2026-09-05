@@ -125,6 +125,37 @@ class AccountingSlipBridgeTests(unittest.TestCase):
         self.assertIsNone(amount)
         printed.assert_not_called()
 
+    def test_date_key_extraction_uses_bounded_date_only_request(self):
+        response = types.SimpleNamespace(
+            status_code=200,
+            json=lambda: {
+                "success": True,
+                "data": {"date": "05/09/2569"},
+            },
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            image_path = Path(temp) / "synthetic-slip.jpg"
+            image_path.write_bytes(b"\xff\xd8\xff\xe0synthetic-jpeg")
+            with patch.dict(
+                os.environ, {"AKSONOCR_API_KEY": "synthetic-test-key"}, clear=True
+            ), patch.object(
+                self.module.requests, "post", return_value=response
+            ) as post:
+                extracted = self.module.call_akson_date_extraction(image_path)
+
+        self.assertEqual(extracted, "05/09/2569")
+        _, kwargs = post.call_args
+        self.assertEqual(
+            json.loads(kwargs["data"]["customFields"]),
+            [{
+                "key": "date",
+                "description": "วันที่ทำรายการบนสลิป วัน/เดือน/ปี พ.ศ.",
+            }],
+        )
+        self.assertIn("หลายวันที่", kwargs["data"]["additionalInstructions"])
+        self.assertIn("ห้ามเดา", kwargs["data"]["additionalInstructions"])
+        self.assertEqual(kwargs["timeout"], 30)
+
     def _staging_environment(self, root):
         return {
             "LEKZA_RUNTIME_ENV": "staging",
@@ -538,6 +569,50 @@ class AccountingSlipBridgeTests(unittest.TestCase):
         self.assertEqual(result, {"action": "skip"})
         ocr.assert_not_called()
 
+    def test_duplicate_replay_returns_before_ocr_or_date_extraction(self):
+        event = types.SimpleNamespace(
+            source=types.SimpleNamespace(
+                platform="telegram", chat_id="1001", user_id="2001"
+            ),
+            media_urls=["https://example.invalid/slip.jpg"],
+            media_types=["image/jpeg"],
+            message_id="duplicate-replay",
+        )
+        duplicate = types.SimpleNamespace(
+            status="duplicate", transaction_id="existing-transaction"
+        )
+        buttons = types.SimpleNamespace(
+            lookup_ocr_ingress=lambda *args: duplicate,
+            obtain_ocr_ingress=lambda *args, **kwargs: self.fail(
+                "duplicate replay must not obtain OCR"
+            ),
+            find_ocr_duplicate_candidates=lambda outcome: [],
+            complete_ocr_ingress=lambda outcome, transaction_id: None,
+        )
+        with tempfile.TemporaryDirectory() as temp, patch.dict(
+            os.environ, self._staging_environment(Path(temp)), clear=True
+        ), patch.dict(
+            "sys.modules", {"lekza_accounting_transaction_buttons": buttons}
+        ), patch.object(self.module, "_materialize_media") as materialize, \
+                patch.object(self.module, "call_akson_ocr") as ocr, \
+                patch.object(
+                    self.module, "call_akson_date_extraction"
+                ) as date_extraction:
+            result = self._image_hook()(
+                event,
+                gateway=types.SimpleNamespace(adapters={
+                    "telegram": types.SimpleNamespace(
+                        _bot=types.SimpleNamespace(id="3001")
+                    )
+                }),
+            )
+
+        self.assertEqual(result["action"], "rewrite")
+        self.assertIn("Duplicate Slip", result["text"])
+        materialize.assert_not_called()
+        ocr.assert_not_called()
+        date_extraction.assert_not_called()
+
     def test_exact_reference_candidate_returns_duplicate_without_handoff(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp) / "staging"
@@ -653,6 +728,155 @@ class AccountingSlipBridgeTests(unittest.TestCase):
         self.assertEqual(
             ocr_result["parsed"]["reference_no"], " SYNTHETIC-CANONICAL-001 "
         )
+
+    def test_date_normalization_accepts_be_and_gregorian_four_digit_dates(self):
+        cases = (
+            ("05/09/2026", "2026-09-05"),
+            ("2026-09-05", "2026-09-05"),
+            ("2500-01-01", "2500-01-01"),
+            ("2569-09-05", "2569-09-05"),
+        )
+        for value, expected in cases:
+            with self.subTest(value=value):
+                normalized = self.module._normalize_ocr_result_for_handoff({
+                    "parsed": {"date": value}
+                })
+                self.assertEqual(normalized["parsed"]["date"], expected)
+
+        self.assertEqual(
+            self.module._normalize_slip_date(
+                "05/09/2569", buddhist_era=True
+            ),
+            "2026-09-05",
+        )
+        self.assertEqual(
+            self.module._normalize_slip_date(
+                "2500-01-01", buddhist_era=True
+            ),
+            "2500-01-01",
+        )
+
+    def test_date_normalization_uses_raw_response_and_rejects_unsafe_dates(self):
+        normalized = self.module._normalize_ocr_result_for_handoff({
+            "parsed": {},
+            "raw_response": {"data": {"date": "05/09/2569"}},
+        })
+        self.assertEqual(normalized["parsed"]["date"], "2569-09-05")
+
+        invalid_values = (
+            "05/09/69",
+            "05/09",
+            "31/02/2569",
+            "2026-02-29",
+            "09/05/2026/extra",
+            "5/9/2026",
+        )
+        for value in invalid_values:
+            with self.subTest(value=value):
+                rejected = self.module._normalize_ocr_result_for_handoff({
+                    "parsed": {"date": value}
+                })
+                self.assertNotIn("date", rejected["parsed"])
+
+        ambiguous = self.module._normalize_ocr_result_for_handoff({
+            "parsed": {"date": "05/09/2026"},
+            "raw_response": {"data": {"date": "06/09/2026"}},
+        })
+        self.assertNotIn("date", ambiguous["parsed"])
+
+    def test_ambiguous_structured_dates_do_not_call_key_extraction(self):
+        raw_result = {
+            "parsed": {"date": "05/09/2026"},
+            "raw_response": {"data": {"date": "06/09/2026"}},
+        }
+        _, ambiguous = self.module._structured_date(raw_result)
+        ocr_result = self.module._normalize_ocr_result_for_handoff(raw_result)
+        with patch.object(
+            self.module, "call_akson_date_extraction"
+        ) as extraction:
+            self.module._add_extracted_date(
+                ocr_result, "synthetic.jpg", ambiguous=ambiguous
+            )
+
+        extraction.assert_not_called()
+        self.assertNotIn("date", ocr_result["parsed"])
+
+    def test_date_key_extraction_is_normalized_before_handoff(self):
+        ocr_result = self.module._normalize_ocr_result_for_handoff({
+            "parsed": {"reference_no": "SYNTHETIC-DATE-001", "amount": 1}
+        })
+        with patch.object(
+            self.module,
+            "call_akson_date_extraction",
+            return_value="05/09/2569",
+        ) as extraction:
+            self.module._add_extracted_date(ocr_result, "synthetic.jpg")
+
+        extraction.assert_called_once_with("synthetic.jpg")
+        self.assertEqual(ocr_result["parsed"]["date"], "2026-09-05")
+
+    def test_valid_structured_date_prevents_date_key_extraction_in_hook(self):
+        cases = (
+            {
+                "akson_called": True,
+                "parsed": {
+                    "reference_no": "DATE-PARSED",
+                    "amount": 1,
+                    "date": "2026-09-05",
+                },
+            },
+            {
+                "akson_called": True,
+                "parsed": {"reference_no": "DATE-RAW", "amount": 1},
+                "raw_response": {"data": {"date": "2026-09-05"}},
+            },
+        )
+        for index, ocr_result in enumerate(cases):
+            with self.subTest(index=index), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp) / "staging"
+                local_path = root / "uploads" / "synthetic.jpg"
+                event = types.SimpleNamespace(
+                    source=types.SimpleNamespace(
+                        platform="telegram", chat_id="1001", user_id="2001"
+                    ),
+                    media_urls=[str(local_path)],
+                    media_types=["image/jpeg"],
+                    message_id=f"valid-date-{index}",
+                )
+                handed_off = []
+                buttons = self._buttons_with_ingress(
+                    lambda *args, **kwargs: handed_off.append(
+                        kwargs["ocr_result"]
+                    ) or {"transaction": {"transaction_id": "synthetic-id"}}
+                )
+                gateway = types.SimpleNamespace(adapters={
+                    "telegram": types.SimpleNamespace(
+                        _bot=types.SimpleNamespace(id="3001")
+                    )
+                })
+                with patch.dict(
+                    os.environ, self._staging_environment(root), clear=True
+                ), patch.dict(
+                    "sys.modules",
+                    {"lekza_accounting_transaction_buttons": buttons},
+                ), patch.object(
+                    self.module, "_materialize_media", return_value=str(local_path)
+                ), patch.object(
+                    self.module, "call_akson_ocr", return_value=ocr_result
+                ), patch.object(
+                    self.module, "call_akson_date_extraction"
+                ) as extraction, patch.object(
+                    self.module.os, "makedirs"
+                ), patch(
+                    "builtins.open", mock_open()
+                ):
+                    result = self._image_hook()(event, gateway=gateway)
+
+                self.assertEqual(result, {"action": "skip"})
+                extraction.assert_not_called()
+                self.assertEqual(
+                    handed_off[0]["parsed"]["date"], "2026-09-05"
+                )
 
     def test_reference_normalization_ignores_case_and_internal_space(self):
         spaced = self.module._normalize_ocr_result_for_handoff({
