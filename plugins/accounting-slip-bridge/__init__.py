@@ -7,6 +7,7 @@ import urllib.parse
 import importlib.util
 import tempfile
 import unicodedata
+from datetime import date as calendar_date
 from pathlib import Path
 
 
@@ -79,6 +80,15 @@ _AKSON_AMOUNT_CUSTOM_FIELDS = [{
 _AKSON_AMOUNT_EXTRACTION_INSTRUCTIONS = (
     "คืนค่า amount เป็นตัวเลขเท่านั้น ไม่รวม THB, ฿ หรือ บาท"
 )
+_AKSON_DATE_CUSTOM_FIELDS = [{
+    "key": "date",
+    "description": "วันที่ทำรายการบนสลิป วัน/เดือน/ปี พ.ศ.",
+}]
+_AKSON_DATE_EXTRACTION_INSTRUCTIONS = (
+    "คืนค่า date เฉพาะเมื่อวันที่ทำรายการชัดเจนเพียงวันที่เดียว "
+    "ถ้าไม่ชัดเจนหรือมีหลายวันที่ให้คืนค่าว่าง ห้ามเดา"
+)
+_AMBIGUOUS_STRUCTURED_DATE = "__lekza_ambiguous_structured_date__"
 
 
 def _sanitized_error_message(exc):
@@ -168,6 +178,60 @@ def _amount_from_text(ocr_result):
     return None
 
 
+def _normalize_slip_date(value, *, buddhist_era=False):
+    if not isinstance(value, str):
+        return None
+    value = unicodedata.normalize("NFKC", value).strip()
+    slash_match = re.fullmatch(r"(\d{2})/(\d{2})/(\d{4})", value)
+    iso_match = re.fullmatch(r"(\d{4})-(\d{2})-(\d{2})", value)
+    if slash_match:
+        day, month, year = map(int, slash_match.groups())
+    elif iso_match:
+        year, month, day = map(int, iso_match.groups())
+    else:
+        return None
+    if buddhist_era and slash_match:
+        year -= 543
+    try:
+        return calendar_date(year, month, day).isoformat()
+    except ValueError:
+        return None
+
+
+def _structured_date(ocr_result):
+    mappings = []
+    parsed = ocr_result.get("parsed")
+    if isinstance(parsed, dict):
+        mappings.append(parsed)
+    raw_response = ocr_result.get("raw_response")
+    if isinstance(raw_response, dict):
+        for candidate in (
+            raw_response.get("parsed"),
+            raw_response.get("data"),
+            raw_response,
+        ):
+            if isinstance(candidate, dict):
+                mappings.append(candidate)
+    dates = {
+        normalized
+        for mapping in mappings
+        if "date" in mapping
+        for normalized in (_normalize_slip_date(mapping.get("date")),)
+        if normalized is not None
+    }
+    if len(dates) == 1:
+        return dates.pop(), False
+    return None, len(dates) > 1
+
+
+def _has_ambiguous_structured_date(ocr_result):
+    parsed = ocr_result.get("parsed")
+    return (
+        isinstance(parsed, dict)
+        and parsed.get("date") == _AMBIGUOUS_STRUCTURED_DATE
+    )
+
+
 def _normalize_ocr_result_for_handoff(ocr_result):
     if not isinstance(ocr_result, dict):
         raise ValueError("OCR result must be a mapping")
@@ -207,6 +271,10 @@ def _normalize_ocr_result_for_handoff(ocr_result):
         amount = _amount_from_text(ocr_result)
     if amount is not None:
         parsed["amount"] = amount
+    normalized_date, _ = _structured_date(ocr_result)
+    parsed.pop("date", None)
+    if normalized_date is not None:
+        parsed["date"] = normalized_date
     normalized["parsed"] = parsed
     return normalized
 
@@ -394,6 +462,60 @@ def call_akson_amount_extraction(image_path):
     if not isinstance(data, dict):
         return None
     return data.get("amount")
+
+
+def call_akson_date_extraction(image_path):
+    """Return only the requested date scalar, or None on any failure."""
+    api_key = os.getenv("AKSONOCR_API_KEY")
+    target_path = str(image_path)
+    if not api_key or not os.path.exists(target_path):
+        return None
+
+    try:
+        filename = os.path.basename(target_path) or "slip.jpg"
+        with open(target_path, "rb") as stream:
+            response = requests.post(
+                _AKSON_AMOUNT_EXTRACTION_URL,
+                headers={"X-API-Key": api_key},
+                files={"file": (filename, stream, "image/jpeg")},
+                data={
+                    "customFields": json.dumps(
+                        _AKSON_DATE_CUSTOM_FIELDS, ensure_ascii=False
+                    ),
+                    "additionalInstructions": (
+                        _AKSON_DATE_EXTRACTION_INSTRUCTIONS
+                    ),
+                    "model": "AksonOCR-preview",
+                },
+                timeout=_AKSON_AMOUNT_EXTRACTION_TIMEOUT_SECONDS,
+            )
+        if response.status_code >= 300:
+            return None
+        result = response.json()
+    except Exception:
+        return None
+
+    if not isinstance(result, dict) or result.get("success") is not True:
+        return None
+    data = result.get("data")
+    if not isinstance(data, dict):
+        return None
+    return data.get("date")
+
+
+def _add_extracted_date(ocr_result, image_path, *, ambiguous=False):
+    parsed = ocr_result["parsed"]
+    if parsed.get("date") is not None or ambiguous:
+        return
+    try:
+        extracted_date = call_akson_date_extraction(image_path)
+    except Exception:
+        extracted_date = None
+    normalized_date = _normalize_slip_date(
+        extracted_date, buddhist_era=True
+    )
+    if normalized_date is not None:
+        parsed["date"] = normalized_date
 
 
 def call_akson_ocr(image_path_or_url):
@@ -621,11 +743,14 @@ def register(ctx):
                 )
 
             ingress_outcome = None
+            date_extraction_attempted = False
 
             def read_normalized_ocr():
+                nonlocal date_extraction_attempted
                 result = call_akson_ocr(target_path)
                 if not result.get("akson_called"):
                     return result
+                _, date_ambiguous = _structured_date(result)
                 normalized = _normalize_ocr_result_for_handoff(result)
                 parsed = normalized["parsed"]
                 if parsed.get("amount") is None:
@@ -635,6 +760,13 @@ def register(ctx):
                         extracted_amount = None
                     if extracted_amount is not None:
                         parsed["amount"] = extracted_amount
+                if date_ambiguous:
+                    normalized["parsed"]["date"] = (
+                        _AMBIGUOUS_STRUCTURED_DATE
+                    )
+                else:
+                    _add_extracted_date(normalized, target_path)
+                date_extraction_attempted = True
                 normalized["akson_called"] = True
                 return normalized
 
@@ -660,6 +792,12 @@ def register(ctx):
                             pass
                     return _duplicate_ingress_response(ingress_outcome)
                 ocr_res = ingress_outcome.ocr_result
+                persisted_date_ambiguity = (
+                    _has_ambiguous_structured_date(ocr_res)
+                )
+                if persisted_date_ambiguity:
+                    ocr_res = _normalize_ocr_result_for_handoff(ocr_res)
+                    ingress_outcome.ocr_result = ocr_res
                 candidates = telegram_buttons.find_ocr_duplicate_candidates(
                     ingress_outcome
                 )
@@ -686,6 +824,13 @@ def register(ctx):
                     return _duplicate_ingress_response(ingress_outcome)
                 if candidates:
                     ocr_res["duplicate_candidate"] = candidates[0]
+                if not date_extraction_attempted:
+                    ocr_res = _normalize_ocr_result_for_handoff(ocr_res)
+                    _add_extracted_date(
+                        ocr_res,
+                        target_path,
+                        ambiguous=persisted_date_ambiguity,
+                    )
             
             # Log OCR result update
             ocr_log = {
@@ -712,9 +857,9 @@ def register(ctx):
                     if telegram_buttons is None:
                         import lekza_accounting_transaction_buttons as telegram_buttons
 
-                    normalized_ocr_res = (
-                        ocr_res if ingress_outcome is not None
-                        else _normalize_ocr_result_for_handoff(ocr_res)
+                    _, date_ambiguous = _structured_date(ocr_res)
+                    normalized_ocr_res = _normalize_ocr_result_for_handoff(
+                        ocr_res
                     )
                     parsed_fields = normalized_ocr_res["parsed"]
                     if ingress_outcome is None and parsed_fields.get("amount") is None:
@@ -726,6 +871,12 @@ def register(ctx):
                             extracted_amount = None
                         if extracted_amount is not None:
                             parsed_fields["amount"] = extracted_amount
+                    if ingress_outcome is None:
+                        _add_extracted_date(
+                            normalized_ocr_res,
+                            target_path,
+                            ambiguous=date_ambiguous,
+                        )
                     handoff = telegram_buttons.handoff_ocr_result(
                         event,
                         gateway,
