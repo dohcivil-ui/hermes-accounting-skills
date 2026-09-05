@@ -45,6 +45,64 @@ class AccountingSlipBridgeTests(unittest.TestCase):
         self.assertIn("Image file not found", result["error"])
         post.assert_not_called()
 
+    def test_amount_key_extraction_uses_bounded_amount_only_request(self):
+        response = types.SimpleNamespace(
+            status_code=200,
+            json=lambda: {
+                "success": True,
+                "data": {"amount": "1250.50"},
+            },
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            image_path = Path(temp) / "synthetic-slip.jpg"
+            image_path.write_bytes(b"\xff\xd8\xff\xe0synthetic-jpeg")
+            with patch.dict(
+                os.environ, {"AKSONOCR_API_KEY": "synthetic-test-key"}, clear=True
+            ), patch.object(
+                self.module.requests, "post", return_value=response
+            ) as post:
+                amount = self.module.call_akson_amount_extraction(image_path)
+
+        self.assertEqual(amount, "1250.50")
+        _, kwargs = post.call_args
+        self.assertEqual(
+            post.call_args.args[0],
+            "https://backend.aksonocr.com/api/v1/key-extract",
+        )
+        self.assertEqual(kwargs["timeout"], 30)
+        self.assertEqual(
+            json.loads(kwargs["data"]["customFields"]),
+            [{
+                "key": "amount",
+                "description": (
+                    "ยอดเงินที่โอนหรือชำระในสลิป "
+                    "ส่งคืนเฉพาะตัวเลข ไม่รวม THB, ฿ หรือ บาท"
+                ),
+            }],
+        )
+        self.assertIn("ตัวเลขเท่านั้น", kwargs["data"]["additionalInstructions"])
+        self.assertEqual(kwargs["data"]["model"], "AksonOCR-preview")
+
+    def test_amount_key_extraction_failure_returns_none_without_response_leak(self):
+        secret_response = "payer=Private Person account=999 amount=9876.54"
+        response = types.SimpleNamespace(
+            status_code=500,
+            text=secret_response,
+            json=lambda: {"raw": secret_response},
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            image_path = Path(temp) / "synthetic-slip.jpg"
+            image_path.write_bytes(b"\xff\xd8\xff\xe0synthetic-jpeg")
+            with patch.dict(
+                os.environ, {"AKSONOCR_API_KEY": "synthetic-test-key"}, clear=True
+            ), patch.object(
+                self.module.requests, "post", return_value=response
+            ), patch("builtins.print") as printed:
+                amount = self.module.call_akson_amount_extraction(image_path)
+
+        self.assertIsNone(amount)
+        printed.assert_not_called()
+
     def _staging_environment(self, root):
         return {
             "LEKZA_RUNTIME_ENV": "staging",
@@ -315,158 +373,7 @@ class AccountingSlipBridgeTests(unittest.TestCase):
         self.assertEqual(result, {"action": "skip"})
         self.assertEqual(handed_off, [str(local_path)])
 
-    def test_ocr_normalization_preserves_parsed_reference_no(self):
-        ocr_result = {
-            "parsed": {"reference_no": " SYNTHETIC-CANONICAL-001 ", "amount": 1}
-        }
-
-        normalized = self.module._normalize_ocr_result_for_handoff(ocr_result)
-
-        self.assertEqual(
-            normalized["parsed"]["reference_no"], "SYNTHETIC-CANONICAL-001"
-        )
-        self.assertEqual(
-            ocr_result["parsed"]["reference_no"], " SYNTHETIC-CANONICAL-001 "
-        )
-
-    def test_amount_shape_evidence_keeps_structure_without_sensitive_values(self):
-        ocr_result = {
-            "parsed": {"amount": "wrapper-value-must-not-be-inspected"},
-            "raw_response": {
-                "amount": 1234.56,
-                "data": {
-                    "totalAmount": "1,234.56 บาท",
-                    "fields": [{"amount": {"value": 1234.56}}],
-                },
-                "Synthetic Private Person": {"amount": 3456.78},
-                "pages": [
-                    {
-                        "markdown": (
-                            "Reference: SYNTHETIC-REFERENCE-001\n"
-                            "Payer: Synthetic Private Person\n"
-                            "Account: 999-8-77777-6\n"
-                            "| **จำนวนเงินที่โอน** | ฿ 1,234.56 บาท |\n"
-                            "Amount (THB) = 2,345.67 THB"
-                        )
-                    }
-                ],
-            },
-        }
-
-        evidence = self.module._sanitized_amount_shape_evidence(ocr_result)
-
-        self.assertEqual(
-            evidence,
-            [
-                {"path": "$.amount", "json_type": "number"},
-                {"path": "$.data.totalAmount", "json_type": "string"},
-                {"path": "$.data.fields[0].amount", "json_type": "object"},
-                {"path": "$.<key>.amount", "json_type": "number"},
-                {
-                    "path": "$.pages[0].markdown",
-                    "json_type": "string",
-                    "markdown_line": (
-                        "| **จำนวนเงินที่โอน** | ฿ <AMOUNT> บาท |"
-                    ),
-                },
-                {
-                    "path": "$.pages[0].markdown",
-                    "json_type": "string",
-                    "markdown_line": "Amount (THB) = <AMOUNT> THB",
-                },
-            ],
-        )
-        serialized = json.dumps(evidence, ensure_ascii=False)
-        for sensitive_value in (
-            "1234.56",
-            "1,234.56",
-            "2,345.67",
-            "3456.78",
-            "SYNTHETIC-REFERENCE-001",
-            "Synthetic Private Person",
-            "999-8-77777-6",
-            "wrapper-value-must-not-be-inspected",
-        ):
-            self.assertNotIn(sensitive_value, serialized)
-
-    def test_amount_shape_evidence_redacts_untrusted_amount_key_names(self):
-        untrusted_keys = (
-            "JoeAmount",
-            "acct12Amount",
-            "refXAmount",
-            "amount_Jane",
-            "amount_999-8",
-        )
-
-        for key in untrusted_keys:
-            with self.subTest(key=key):
-                evidence = self.module._sanitized_amount_shape_evidence({
-                    "raw_response": {key: 1234.56}
-                })
-                self.assertEqual(
-                    evidence,
-                    [{"path": "$.<key>", "json_type": "number"}],
-                )
-                serialized = json.dumps(evidence, ensure_ascii=False)
-                self.assertNotIn(key, serialized)
-                self.assertNotIn("1234.56", serialized)
-
-    def test_amount_shape_scan_stops_at_global_node_limit(self):
-        limit = self.module._MAX_AMOUNT_SHAPE_SCAN_NODES
-        raw_response = {
-            "items": [{} for _ in range(limit)],
-            "amount": 1234.56,
-        }
-
-        first = self.module._sanitized_amount_shape_evidence({
-            "raw_response": raw_response
-        })
-        second = self.module._sanitized_amount_shape_evidence({
-            "raw_response": raw_response
-        })
-
-        self.assertEqual(first, [])
-        self.assertEqual(second, first)
-
-    def test_amount_shape_scan_stops_at_global_text_limit(self):
-        limit = self.module._MAX_AMOUNT_SHAPE_SCAN_TEXT_CHARS
-        raw_response = {
-            "text": "x" * limit,
-            "markdown": "Amount: 1,234.56",
-        }
-
-        evidence = self.module._sanitized_amount_shape_evidence({
-            "raw_response": raw_response
-        })
-
-        self.assertEqual(evidence, [])
-
-    def test_amount_shape_scan_does_not_inspect_oversized_key(self):
-        limit = self.module._MAX_AMOUNT_SHAPE_KEY_CHARS
-        oversized_key = "amount_" + ("Jane" * limit)
-
-        evidence = self.module._sanitized_amount_shape_evidence({
-            "raw_response": {oversized_key: 1234.56}
-        })
-
-        self.assertEqual(evidence, [])
-
-    def test_amount_shape_scan_does_not_iterate_beyond_depth_limit(self):
-        class UnexpectedIteration(dict):
-            def items(self):
-                raise AssertionError("walked beyond amount diagnostic depth limit")
-
-        raw_response = UnexpectedIteration()
-        for _ in range(self.module._MAX_AMOUNT_SHAPE_DEPTH):
-            raw_response = {"data": raw_response}
-
-        evidence = self.module._sanitized_amount_shape_evidence({
-            "raw_response": raw_response
-        })
-
-        self.assertEqual(evidence, [])
-
-    def test_image_hook_logs_only_sanitized_amount_shape_evidence(self):
+    def test_missing_normalized_amount_uses_key_extraction_before_handoff(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp) / "staging"
             environment = self._staging_environment(root)
@@ -479,10 +386,60 @@ class AccountingSlipBridgeTests(unittest.TestCase):
                 media_types=["image/jpeg"],
                 message_id="synthetic-message",
             )
+            handed_off = []
             buttons = types.SimpleNamespace(
-                handoff_ocr_result=lambda *args, **kwargs: {
-                    "transaction": {"transaction_id": "synthetic-id"}
-                }
+                handoff_ocr_result=lambda *args, **kwargs: handed_off.append(
+                    kwargs["ocr_result"]
+                ) or {"transaction": {"transaction_id": "synthetic-id"}}
+            )
+            gateway = types.SimpleNamespace(adapters={
+                "telegram": types.SimpleNamespace(
+                    _bot=types.SimpleNamespace(id="3001")
+                )
+            })
+            with patch.dict(os.environ, environment, clear=True), patch.dict(
+                "sys.modules", {"lekza_accounting_transaction_buttons": buttons}
+            ), patch.object(
+                self.module, "_materialize_media", return_value=str(local_path)
+            ), patch.object(
+                self.module,
+                "call_akson_ocr",
+                return_value={
+                    "akson_called": True,
+                    "parsed": {"reference_no": "SYNTHETIC-FALLBACK-001"},
+                },
+            ), patch.object(
+                self.module,
+                "call_akson_amount_extraction",
+                return_value="1250.50",
+            ) as fallback, patch.object(self.module.os, "makedirs"), patch(
+                "builtins.open", mock_open()
+            ):
+                result = self._image_hook()(event, gateway=gateway)
+
+        self.assertEqual(result, {"action": "skip"})
+        fallback.assert_called_once_with(str(local_path))
+        self.assertEqual(handed_off[0]["parsed"]["amount"], "1250.50")
+
+    def test_key_extraction_exception_keeps_manual_amount_without_secret_log(self):
+        secret_response = "payer=Private Person account=999 amount=9876.54"
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "staging"
+            environment = self._staging_environment(root)
+            local_path = root / "uploads" / "telegram-slip.jpg"
+            event = types.SimpleNamespace(
+                source=types.SimpleNamespace(
+                    platform="telegram", chat_id="1001", user_id="2001"
+                ),
+                media_urls=["https://example.invalid/slip.jpg"],
+                media_types=["image/jpeg"],
+                message_id="synthetic-message",
+            )
+            handed_off = []
+            buttons = types.SimpleNamespace(
+                handoff_ocr_result=lambda *args, **kwargs: handed_off.append(
+                    kwargs["ocr_result"]
+                ) or {"transaction": {"transaction_id": "synthetic-id"}}
             )
             gateway = types.SimpleNamespace(adapters={
                 "telegram": types.SimpleNamespace(
@@ -499,45 +456,36 @@ class AccountingSlipBridgeTests(unittest.TestCase):
                 "call_akson_ocr",
                 return_value={
                     "akson_called": True,
-                    "parsed": {"reference_no": "SYNTHETIC-REFERENCE-001"},
-                    "raw_response": {
-                        "pages": [{
-                            "markdown": (
-                                "Payer: Synthetic Private Person\n"
-                                "จำนวนเงินที่โอน: 9,876.54 บาท"
-                            )
-                        }]
-                    },
+                    "parsed": {"reference_no": "SYNTHETIC-FALLBACK-FAIL"},
                 },
+            ), patch.object(
+                self.module,
+                "call_akson_amount_extraction",
+                side_effect=RuntimeError(secret_response),
             ), patch.object(self.module.os, "makedirs"), patch(
                 "builtins.open", opened
             ):
                 result = self._image_hook()(event, gateway=gateway)
 
         self.assertEqual(result, {"action": "skip"})
-        entries = [
-            json.loads(call.args[0])
-            for call in opened().write.call_args_list
-            if self.module._AMOUNT_SHAPE_LOG_TAG in call.args[0]
-        ]
+        self.assertNotIn("amount", handed_off[0]["parsed"])
+        logged = "".join(str(call.args[0]) for call in opened().write.call_args_list)
+        self.assertNotIn(secret_response, logged)
+        self.assertNotIn("9876.54", logged)
+
+    def test_ocr_normalization_preserves_parsed_reference_no(self):
+        ocr_result = {
+            "parsed": {"reference_no": " SYNTHETIC-CANONICAL-001 ", "amount": 1}
+        }
+
+        normalized = self.module._normalize_ocr_result_for_handoff(ocr_result)
+
         self.assertEqual(
-            entries,
-            [{
-                "diagnostic": self.module._AMOUNT_SHAPE_LOG_TAG,
-                "amount_shape": [{
-                    "path": "$.pages[0].markdown",
-                    "json_type": "string",
-                    "markdown_line": "จำนวนเงินที่โอน: <AMOUNT> บาท",
-                }],
-            }],
+            normalized["parsed"]["reference_no"], "SYNTHETIC-CANONICAL-001"
         )
-        serialized = json.dumps(entries, ensure_ascii=False)
-        for sensitive_value in (
-            "9,876.54",
-            "SYNTHETIC-REFERENCE-001",
-            "Synthetic Private Person",
-        ):
-            self.assertNotIn(sensitive_value, serialized)
+        self.assertEqual(
+            ocr_result["parsed"]["reference_no"], " SYNTHETIC-CANONICAL-001 "
+        )
 
     def test_ocr_normalization_uses_fallback_key_or_labeled_text(self):
         cases = (
@@ -638,13 +586,16 @@ class AccountingSlipBridgeTests(unittest.TestCase):
                     "parsed": {"amount": 1},
                     "raw_ocr_text": "Reference No: SYNTHETIC-HANDOFF-001",
                 },
-            ), patch.object(self.module.os, "makedirs"), patch(
+            ), patch.object(
+                self.module, "call_akson_amount_extraction"
+            ) as fallback, patch.object(self.module.os, "makedirs"), patch(
                 "builtins.open", mock_open()
             ):
                 result = self._image_hook()(event, gateway=gateway)
 
         self.assertEqual(result, {"action": "skip"})
         self.assertEqual(handed_off, ["SYNTHETIC-HANDOFF-001"])
+        fallback.assert_not_called()
 
     def test_handoff_failure_log_has_sanitized_truncated_error_message(self):
         secret_token = "synthetic-secret-token-value"

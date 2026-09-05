@@ -65,181 +65,20 @@ _AMOUNT_TEXT_PATTERN = re.compile(
     r"(?:THB\s*|฿\s*)?"
     r"((?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?)(?![\w.,])"
 )
-_AMOUNT_SHAPE_LOG_TAG = "[DEBUG-RC6-AMOUNT-SHAPE]"
-_MAX_AMOUNT_SHAPE_EVIDENCE_ITEMS = 32
-_MAX_AMOUNT_SHAPE_SCAN_NODES = 256
-_MAX_AMOUNT_SHAPE_SCAN_TEXT_CHARS = 32768
-_MAX_AMOUNT_SHAPE_KEY_CHARS = 128
-_MAX_AMOUNT_SHAPE_DEPTH = 8
-_AMOUNT_KEY_MARKERS = (
-    "amount",
-    "จำนวนเงิน",
-    "ยอดเงิน",
-    "ยอดโอน",
-    "ยอดชำระ",
+_AKSON_AMOUNT_EXTRACTION_URL = (
+    "https://backend.aksonocr.com/api/v1/key-extract"
 )
-_SAFE_AMOUNT_PATH_NAMES = {
-    "amount": "amount",
-    "totalamount": "totalAmount",
-    "transferamount": "transferAmount",
-    "transactionamount": "transactionAmount",
-    "จำนวนเงิน": "จำนวนเงิน",
-    "ยอดเงิน": "ยอดเงิน",
-    "ยอดโอน": "ยอดโอน",
-    "ยอดชำระ": "ยอดชำระ",
-    "data": "data",
-    "document": "document",
-    "documents": "documents",
-    "extracted": "extracted",
-    "fields": "fields",
-    "items": "items",
-    "markdown": "markdown",
-    "ocr": "ocr",
-    "output": "output",
-    "pages": "pages",
-    "parsed": "parsed",
-    "raw_ocr_text": "raw_ocr_text",
-    "response": "response",
-    "result": "result",
-    "results": "results",
-    "slip": "slip",
-    "text": "text",
-    "transactions": "transactions",
-}
-_AMOUNT_MARKDOWN_SHAPE_PATTERN = re.compile(
-    r"(?i)"
-    r"(?P<prefix>(?:[|>#*_`~\-]\s*)*)"
-    r"(?P<label>"
-    r"(?:(?:total|transfer)\s+)?amount"
-    r"(?:\s*\(\s*(?:thb|baht)\s*\))?"
-    r"|(?:จำนวนเงิน|ยอดเงิน|ยอดโอน|ยอดชำระ)(?:ที่โอน|รวม|สุทธิ)?"
-    r")"
-    r"(?P<label_close>(?:\*{1,3}|_{1,3}|`{1,3})?\s*)"
-    r"(?P<separator>[:：=|\-–—]?)"
-    r"(?P<after_separator>\s*)"
-    r"(?P<currency_before>(?:THB|฿|บาท)?)"
-    r"(?P<before_amount>\s*)"
-    r"(?P<amount>[+-]?\d(?:[\d,.，．\u00a0 ]*\d)?)"
-    r"(?P<after_amount>\s*)"
-    r"(?P<currency_after>(?:THB|฿|บาท)?)"
-    r"(?P<suffix>(?:\s*(?:\*{1,3}|_{1,3}|`{1,3}|\|))*)"
+_AKSON_AMOUNT_EXTRACTION_TIMEOUT_SECONDS = 30
+_AKSON_AMOUNT_CUSTOM_FIELDS = [{
+    "key": "amount",
+    "description": (
+        "ยอดเงินที่โอนหรือชำระในสลิป "
+        "ส่งคืนเฉพาะตัวเลข ไม่รวม THB, ฿ หรือ บาท"
+    ),
+}]
+_AKSON_AMOUNT_EXTRACTION_INSTRUCTIONS = (
+    "คืนค่า amount เป็นตัวเลขเท่านั้น ไม่รวม THB, ฿ หรือ บาท"
 )
-
-
-def _json_type(value):
-    if value is None:
-        return "null"
-    if isinstance(value, bool):
-        return "boolean"
-    if isinstance(value, (int, float)):
-        return "number"
-    if isinstance(value, str):
-        return "string"
-    if isinstance(value, dict):
-        return "object"
-    if isinstance(value, list):
-        return "array"
-    return "unknown"
-
-
-def _is_amount_key(key):
-    if not isinstance(key, str) or len(key) > _MAX_AMOUNT_SHAPE_KEY_CHARS:
-        return False
-    normalized = unicodedata.normalize("NFKC", key).lower()
-    compact = re.sub(r"[\W_]", "", normalized)
-    return any(marker in compact for marker in _AMOUNT_KEY_MARKERS)
-
-
-def _safe_amount_path_key(key):
-    if not isinstance(key, str) or len(key) > _MAX_AMOUNT_SHAPE_KEY_CHARS:
-        return "<key>"
-    normalized = unicodedata.normalize("NFKC", key)
-    return _SAFE_AMOUNT_PATH_NAMES.get(normalized.lower(), "<key>")
-
-
-def _sanitized_markdown_amount_lines(text):
-    for line in text.splitlines():
-        for match in _AMOUNT_MARKDOWN_SHAPE_PATTERN.finditer(line):
-            rendered = match.group(0)
-            amount_start = match.start("amount") - match.start()
-            amount_end = match.end("amount") - match.start()
-            yield (
-                rendered[:amount_start] + "<AMOUNT>" + rendered[amount_end:]
-            )
-
-
-def _sanitized_amount_shape_evidence(ocr_result):
-    """Return value-free amount shape metadata from the AksonOCR response."""
-    if not isinstance(ocr_result, dict):
-        return []
-    raw_response = ocr_result.get("raw_response")
-    if not isinstance(raw_response, (dict, list)):
-        return []
-
-    evidence = []
-
-    def add(item):
-        if item not in evidence and len(evidence) < _MAX_AMOUNT_SHAPE_EVIDENCE_ITEMS:
-            evidence.append(item)
-
-    scanned_nodes = 0
-    scanned_text_chars = 0
-
-    def walk(value, path, depth=0, amount_key=False):
-        nonlocal scanned_nodes, scanned_text_chars
-        if (
-            len(evidence) >= _MAX_AMOUNT_SHAPE_EVIDENCE_ITEMS
-            or scanned_nodes >= _MAX_AMOUNT_SHAPE_SCAN_NODES
-            or depth > _MAX_AMOUNT_SHAPE_DEPTH
-        ):
-            return
-        scanned_nodes += 1
-        if amount_key:
-            add({"path": path, "json_type": _json_type(value)})
-        if isinstance(value, str):
-            remaining_chars = (
-                _MAX_AMOUNT_SHAPE_SCAN_TEXT_CHARS - scanned_text_chars
-            )
-            if remaining_chars <= 0:
-                return
-            bounded_text = value[:remaining_chars]
-            scanned_text_chars += len(bounded_text)
-            for line in _sanitized_markdown_amount_lines(bounded_text):
-                add({
-                    "path": path,
-                    "json_type": "string",
-                    "markdown_line": line,
-                })
-                if len(evidence) >= _MAX_AMOUNT_SHAPE_EVIDENCE_ITEMS:
-                    return
-        if depth >= _MAX_AMOUNT_SHAPE_DEPTH:
-            return
-        if isinstance(value, dict):
-            for key, child in value.items():
-                safe_key = _safe_amount_path_key(key)
-                child_path = f"{path}.{safe_key}"
-                walk(
-                    child,
-                    child_path,
-                    depth + 1,
-                    amount_key=_is_amount_key(key),
-                )
-                if (
-                    len(evidence) >= _MAX_AMOUNT_SHAPE_EVIDENCE_ITEMS
-                    or scanned_nodes >= _MAX_AMOUNT_SHAPE_SCAN_NODES
-                ):
-                    return
-        elif isinstance(value, list):
-            for index, child in enumerate(value):
-                walk(child, f"{path}[{index}]", depth + 1)
-                if (
-                    len(evidence) >= _MAX_AMOUNT_SHAPE_EVIDENCE_ITEMS
-                    or scanned_nodes >= _MAX_AMOUNT_SHAPE_SCAN_NODES
-                ):
-                    return
-
-    walk(raw_response, "$")
-    return evidence
 
 
 def _sanitized_error_message(exc):
@@ -517,6 +356,46 @@ def _materialize_media(image_path_or_url):
         raise
     return local_path
 
+
+def call_akson_amount_extraction(image_path):
+    """Return only the requested amount scalar, or None on any failure."""
+    api_key = os.getenv("AKSONOCR_API_KEY")
+    target_path = str(image_path)
+    if not api_key or not os.path.exists(target_path):
+        return None
+
+    try:
+        filename = os.path.basename(target_path) or "slip.jpg"
+        with open(target_path, "rb") as stream:
+            response = requests.post(
+                _AKSON_AMOUNT_EXTRACTION_URL,
+                headers={"X-API-Key": api_key},
+                files={"file": (filename, stream, "image/jpeg")},
+                data={
+                    "customFields": json.dumps(
+                        _AKSON_AMOUNT_CUSTOM_FIELDS, ensure_ascii=False
+                    ),
+                    "additionalInstructions": (
+                        _AKSON_AMOUNT_EXTRACTION_INSTRUCTIONS
+                    ),
+                    "model": "AksonOCR-preview",
+                },
+                timeout=_AKSON_AMOUNT_EXTRACTION_TIMEOUT_SECONDS,
+            )
+        if response.status_code >= 300:
+            return None
+        result = response.json()
+    except Exception:
+        return None
+
+    if not isinstance(result, dict) or result.get("success") is not True:
+        return None
+    data = result.get("data")
+    if not isinstance(data, dict):
+        return None
+    return data.get("amount")
+
+
 def call_akson_ocr(image_path_or_url):
     api_key = os.getenv("AKSONOCR_API_KEY")
     if not api_key:
@@ -705,18 +584,6 @@ def register(ctx):
                 f.write(json.dumps(ocr_log, ensure_ascii=False) + "\n")
 
             if ocr_res.get("akson_called"):
-                try:
-                    amount_shape_log = {
-                        "diagnostic": _AMOUNT_SHAPE_LOG_TAG,
-                        "amount_shape": _sanitized_amount_shape_evidence(ocr_res),
-                    }
-                    with open(log_file, "a", encoding="utf-8") as f:
-                        f.write(
-                            json.dumps(amount_shape_log, ensure_ascii=False) + "\n"
-                        )
-                except Exception:
-                    # Temporary diagnostics must never block the existing handoff.
-                    pass
                 confidence = ocr_res.get("confidence")
                 raw_text = ocr_res.get("raw_ocr_text", "")
                 parsed_fields = ocr_res.get("parsed", {})
@@ -729,6 +596,15 @@ def register(ctx):
 
                     normalized_ocr_res = _normalize_ocr_result_for_handoff(ocr_res)
                     parsed_fields = normalized_ocr_res["parsed"]
+                    if parsed_fields.get("amount") is None:
+                        try:
+                            extracted_amount = call_akson_amount_extraction(
+                                target_path
+                            )
+                        except Exception:
+                            extracted_amount = None
+                        if extracted_amount is not None:
+                            parsed_fields["amount"] = extracted_amount
                     handoff = telegram_buttons.handoff_ocr_result(
                         event,
                         gateway,

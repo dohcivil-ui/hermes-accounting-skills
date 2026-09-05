@@ -1210,7 +1210,7 @@ class TelegramTransactionWiringTests(unittest.TestCase):
             "http_status": 200,
             "confidence": 0.97,
             "raw_ocr_text": "synthetic",
-            "parsed": {"reference_no": "PHASE-C-HANDOFF", "amount": "9.50"},
+            "parsed": {"reference_no": "PHASE-C-HANDOFF"},
             "usage": {},
         }
         restarted_stores = []
@@ -1259,6 +1259,11 @@ class TelegramTransactionWiringTests(unittest.TestCase):
                         if value.startswith("https://") else value,
                     ), \
                     patch.object(bridge, "call_akson_ocr", return_value=ocr_result), \
+                    patch.object(
+                        bridge,
+                        "call_akson_amount_extraction",
+                        return_value="9.50",
+                    ) as amount_fallback, \
                     patch.object(bridge.os, "makedirs"), \
                     patch("builtins.open", mock_open()):
                 asyncio.run(invoke_twice())
@@ -1270,6 +1275,9 @@ class TelegramTransactionWiringTests(unittest.TestCase):
 
         durable = self.store.get_by_reference("1001", "PHASE-C-HANDOFF")
         self.assertIsNotNone(durable)
+        self.assertEqual(durable["ocr_fields"]["amount"], 9.5)
+        self.assertFalse(durable["needs_amount"])
+        self.assertEqual(amount_fallback.call_count, 2)
         self.assertEqual(durable["initial_prompt_message_id"], "telegram-message-1")
         self.assertEqual(observed_transaction_ids, [durable["transaction_id"]] * 2)
         self.assertEqual(len(sent), 1)
@@ -1278,6 +1286,101 @@ class TelegramTransactionWiringTests(unittest.TestCase):
         self.assertTrue(callbacks)
         identities = [self.wiring.decode_callback(value) for value in callbacks]
         self.assertTrue(all(item.transaction_id == durable["transaction_id"] for item in identities))
+
+    def test_invalid_or_failed_amount_fallback_keeps_durable_manual_entry(self):
+        class Context:
+            def __init__(self):
+                self.hooks = {}
+
+            def register_hook(self, name, callback):
+                self.hooks[name] = callback
+
+        bridge = load_module("lekza_rc7_amount_fallback_bridge", BRIDGE_PATH)
+        bridge_context = Context()
+        bridge.register(bridge_context)
+        source = types.SimpleNamespace(
+            platform="telegram",
+            chat_id="1001",
+            user_id="2002",
+            thread_id=None,
+        )
+        event = types.SimpleNamespace(
+            source=source,
+            media_urls=[str(self.slip)],
+            media_types=["image/jpeg"],
+            message_id=None,
+        )
+
+        def handoff_ocr_result(
+            event, gateway, session_store, *, source_image_path, ocr_result
+        ):
+            transaction = self.flow.begin(
+                tenant_id="1001",
+                platform="telegram",
+                chat_id="1001",
+                thread_id=None,
+                session_id=event.message_id,
+                telegram_user_id="2002",
+                source_image_path=source_image_path,
+                ocr_result=ocr_result,
+            )
+            return {"transaction": transaction}
+
+        buttons = types.SimpleNamespace(handoff_ocr_result=handoff_ocr_result)
+        gateway = types.SimpleNamespace(adapters={
+            "telegram": types.SimpleNamespace(
+                _bot=types.SimpleNamespace(id="3001")
+            )
+        })
+        cases = (
+            ("api-failure", None),
+            ("zero", "0"),
+            ("negative", "-1"),
+            ("malformed", "not-a-number"),
+        )
+
+        try:
+            with patch.dict(os.environ, {"LEKZA_RUNTIME_ENV": "production"}), \
+                    patch.dict(
+                        "sys.modules",
+                        {"lekza_accounting_transaction_buttons": buttons},
+                    ), \
+                    patch.object(
+                        bridge,
+                        "_materialize_media",
+                        return_value=str(self.slip),
+                    ), \
+                    patch.object(bridge, "call_akson_ocr") as ocr, \
+                    patch.object(
+                        bridge,
+                        "call_akson_amount_extraction",
+                        side_effect=[value for _, value in cases],
+                    ) as fallback, \
+                    patch.object(bridge.os, "makedirs"), \
+                    patch("builtins.open", mock_open()):
+                for label, _ in cases:
+                    reference_no = f"RC7-{label.upper()}"
+                    event.message_id = f"rc7-{label}-message"
+                    ocr.return_value = {
+                        "akson_called": True,
+                        "confidence": 1.0,
+                        "parsed": {"reference_no": reference_no},
+                    }
+                    result = bridge_context.hooks["pre_gateway_dispatch"](
+                        event, gateway=gateway
+                    )
+                    self.assertEqual(result, {"action": "skip"})
+
+                    durable = self.store.get_by_reference(
+                        "1001", reference_no
+                    )
+                    self.assertNotIn("amount", durable["ocr_fields"])
+                    self.assertTrue(durable["needs_amount"])
+                    self.assertEqual(durable["entry_mode"], "amount")
+        finally:
+            sys.modules.pop("lekza_rc7_amount_fallback_bridge", None)
+
+        self.assertEqual(fallback.call_count, len(cases))
 
     def test_incompatible_adapter_shape_fails_with_clear_diagnostic(self):
         class IncompatibleAdapter:
