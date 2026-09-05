@@ -1510,7 +1510,10 @@ class TelegramTransactionWiringTests(unittest.TestCase):
                 self.hooks[name] = callback
 
         plugin_context = Context()
-        plugin.register(plugin_context)
+        with patch.object(
+            plugin, "_start_registered_handler_watch", return_value=None
+        ):
+            plugin.register(plugin_context)
         bridge = load_module("lekza_phase_c_bridge", BRIDGE_PATH)
         bridge_context = Context()
         bridge.register(bridge_context)
@@ -1590,7 +1593,9 @@ class TelegramTransactionWiringTests(unittest.TestCase):
                         side_effect=lambda value: str(self.slip)
                         if value.startswith("https://") else value,
                     ), \
-                    patch.object(bridge, "call_akson_ocr", return_value=ocr_result), \
+                    patch.object(
+                        bridge, "call_akson_ocr", return_value=ocr_result
+                    ) as ocr, \
                     patch.object(
                         bridge,
                         "call_akson_amount_extraction",
@@ -1609,7 +1614,8 @@ class TelegramTransactionWiringTests(unittest.TestCase):
         self.assertIsNotNone(durable)
         self.assertEqual(durable["ocr_fields"]["amount"], 9.5)
         self.assertFalse(durable["needs_amount"])
-        self.assertEqual(amount_fallback.call_count, 2)
+        self.assertEqual(amount_fallback.call_count, 1)
+        self.assertEqual(ocr.call_count, 1)
         self.assertEqual(durable["initial_prompt_message_id"], "telegram-message-1")
         self.assertEqual(observed_transaction_ids, [durable["transaction_id"]] * 2)
         self.assertEqual(len(sent), 1)
@@ -1618,6 +1624,35 @@ class TelegramTransactionWiringTests(unittest.TestCase):
         self.assertTrue(callbacks)
         identities = [self.wiring.decode_callback(value) for value in callbacks]
         self.assertTrue(all(item.transaction_id == durable["transaction_id"] for item in identities))
+
+    def test_near_duplicate_candidate_is_visible_before_confirmation(self):
+        candidate = self.flow.begin(
+            tenant_id="tenant-test",
+            platform="telegram",
+            chat_id="1001",
+            thread_id=None,
+            session_id="candidate-session",
+            telegram_user_id="2002",
+            source_image_path=self.slip,
+            ocr_result={
+                "confidence": 0.95,
+                "duplicate_candidate": {
+                    "transaction_id": self.record["transaction_id"],
+                    "reasons": ["near_reference", "amount", "date"],
+                },
+                "parsed": {
+                    "reference_no": "PHASE-C-002",
+                    "amount": "1250.50",
+                    "date": "2026-08-30",
+                },
+            },
+        )
+        prompt = self.controller.render(candidate["transaction_id"], **self.actor)
+        self.assertIn("พบรายการเดิมที่คล้ายกัน", prompt["text"])
+        self.assertEqual(
+            prompt["duplicate_candidate"]["transaction_id"],
+            self.record["transaction_id"],
+        )
 
     def test_invalid_or_failed_amount_fallback_keeps_durable_manual_entry(self):
         class Context:
@@ -1658,7 +1693,19 @@ class TelegramTransactionWiringTests(unittest.TestCase):
             )
             return {"transaction": transaction}
 
-        buttons = types.SimpleNamespace(handoff_ocr_result=handoff_ocr_result)
+        def obtain_ingress(*args, **kwargs):
+            return types.SimpleNamespace(
+                status="ready", ocr_result=kwargs["ocr_reader"](),
+                transaction_id=None,
+            )
+
+        buttons = types.SimpleNamespace(
+            lookup_ocr_ingress=lambda *args: None,
+            obtain_ocr_ingress=obtain_ingress,
+            find_ocr_duplicate_candidates=lambda outcome: [],
+            complete_ocr_ingress=lambda outcome, transaction_id: None,
+            handoff_ocr_result=handoff_ocr_result,
+        )
         gateway = types.SimpleNamespace(adapters={
             "telegram": types.SimpleNamespace(
                 _bot=types.SimpleNamespace(id="3001")

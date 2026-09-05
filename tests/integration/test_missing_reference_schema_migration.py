@@ -10,6 +10,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
 FLOW_PATH = ROOT / "plugins/accounting-slip-bridge/transaction_flow.py"
+ADAPTERS_PATH = ROOT / "plugins/accounting-slip-bridge/google_adapters.py"
 LEGACY_REFERENCE = "LEGACY-REFERENCE-001"
 ASSIGNED_REFERENCE = "MANUAL-REFERENCE-001"
 
@@ -72,6 +73,15 @@ def load_module():
     )
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def load_adapters_module():
+    spec = importlib.util.spec_from_file_location(
+        "lekza_missing_reference_google_adapters", ADAPTERS_PATH
+    )
+    module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
 
@@ -346,6 +356,23 @@ class MissingReferenceSchemaMigrationTests(unittest.TestCase):
                     expected_version=missing["version"],
                     **self.actor,
                 )
+
+            class NoDrive:
+                def reserve_file_id(self):
+                    raise AssertionError("Drive must not be called")
+
+                def upload(self, *args):
+                    raise AssertionError("Drive must not be called")
+
+            class NoSheets:
+                def append_transaction(self, *args, **kwargs):
+                    raise AssertionError("Sheets must not be called")
+
+            pipeline = load_adapters_module().ProductionSavePipeline(
+                flow, NoDrive(), NoSheets()
+            )
+            with self.assertRaises(ValueError):
+                pipeline.save(missing["transaction_id"], **self.actor)
         finally:
             store.close()
 

@@ -15,6 +15,9 @@ Previous stable release: `v0.1.0`.
 - Staging isolation guard, post-interaction verifier, and opt-in disposable
   Google integration test
 - Production dependency pins in `requirements.txt`
+- Durable pre-OCR duplicate-slip protection using Telegram message identity,
+  tenant-scoped source SHA-256, OCR claim leases, restart recovery, and
+  perceptual duplicate-candidate warnings without automatic merging
 - Scheduled daily, rolling seven-day weekly, and month-end project reporting
   with Telegram summaries, UTF-8 HTML attachments, archived Thai-font PDFs,
   and durable per-chunk/per-attachment delivery suppression

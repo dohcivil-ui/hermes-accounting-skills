@@ -12,7 +12,9 @@
 ```text
 Telegram image
   -> accounting-slip-bridge pre_gateway_dispatch hook
+  -> durable tenant/message and tenant/SHA-256 ingress claim
   -> AksonOCR /api/v2/upload
+  -> exact reference guard and perceptual duplicate-candidate check
   -> durable TransactionFlow state created from the existing OCR result
   -> Hermes rewrite with parsed fields and confidence
   -> accounting-transaction-buttons durable Telegram callbacks
@@ -29,6 +31,9 @@ existing OCR result and does not contain an OCR client or make network calls.
 
 - `skills/accounting/process-slip-pipeline/scripts/process_slip.py`: command-line AksonOCR adapter used by the image trigger.
 - `plugins/accounting-slip-bridge`: gateway hook that selects Telegram media, calls AksonOCR, and rewrites the agent input.
+- `plugins/accounting-slip-bridge/ocr_ingress.py`: SQLite-backed pre-OCR
+  message/content ledger, OCR claim lease, sanitized result recovery, and
+  perceptual duplicate-candidate signals.
 - `plugins/accounting-slip-bridge/transaction_flow.py`: SQLite-backed pending state, authorized state transitions, and durable Drive/Sheets checkpoints.
 - `plugins/accounting-slip-bridge/google_adapters.py`: production Google REST adapters and the restart-safe save coordinator.
 - `plugins/accounting-slip-bridge/telegram_wiring.py`: state-derived Telegram prompts and strict callback identities; it owns no OCR or session state.
@@ -118,6 +123,22 @@ Only required parsed OCR fields and confidence are persisted. Raw OCR text,
 provider responses, API credentials, and customer-sensitive diagnostic data are
 not stored by this module. Source images must resolve beneath an approved root,
 must not be symlinks, and must pass image type, extension, and size validation.
+
+Before AksonOCR, the ingress ledger checks a hash of the Telegram bot, tenant,
+chat, actor, and message identity, then reserves the tenant-scoped SHA-256 of
+the validated source bytes under an atomic SQLite claim. Replayed messages,
+byte-identical files, concurrent workers, and restarts recover that ledger
+entry without another OCR call. Sanitized parsed fields and confidence are
+persisted before the transaction handoff, allowing a completed OCR result to
+resume after a crash without retaining raw provider text. A claimed entry that
+expires before an OCR result is durable is treated as ambiguous and fails
+closed rather than spending another OCR request automatically.
+
+The source SHA-256 is also unique on active transaction rows as defense in
+depth. A normalized perceptual fingerprint is never a rejection key. It becomes
+a duplicate-candidate signal only when combined with reference similarity or
+matching amount, date, and counterparty evidence. Candidate transactions remain
+distinct and the Telegram review prompt warns the user before confirmation.
 
 Phase B adds production Drive/Sheets adapters without registering Telegram
 callbacks or changing OCR ownership. Drive pre-generates and durably reserves a

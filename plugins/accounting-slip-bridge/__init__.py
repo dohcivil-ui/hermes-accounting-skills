@@ -99,7 +99,7 @@ def _structured_reference(value):
     if value is None or isinstance(value, (bool, dict, list, tuple, set)):
         return None
     reference = unicodedata.normalize("NFKC", str(value)).strip()
-    reference = re.sub(r"\s+", "-", reference)
+    reference = re.sub(r"\s+", "", reference)
     reference = reference.strip("-._/")
     if not 3 <= len(reference) <= 128:
         return None
@@ -486,6 +486,36 @@ def call_akson_ocr(image_path_or_url):
         "raw_response": result
     }
 
+
+def _duplicate_ingress_response(outcome):
+    status = getattr(outcome, "status", "failed")
+    transaction_id = getattr(outcome, "transaction_id", None)
+    if status == "duplicate":
+        detail = f" transaction_id={transaction_id}" if transaction_id else ""
+        message = (
+            "[Lekza Duplicate Slip]\n"
+            f"พบสลิปนี้เป็นรายการเดิมแล้ว{detail}\n"
+            "ห้ามเรียก OCR หรือบันทึก Drive/Sheets ซ้ำ"
+        )
+    elif status == "processing":
+        message = (
+            "[Lekza Duplicate Slip]\n"
+            "สลิปนี้กำลังประมวลผลอยู่ ห้ามเรียก OCR หรือบันทึกซ้ำ"
+        )
+    elif status == "ambiguous":
+        message = (
+            "[Lekza OCR Reconciliation Required]\n"
+            "พบ OCR claim ที่ผลลัพธ์ไม่แน่ชัดหลังหมด lease "
+            "ระบบหยุดแบบ fail-closed และไม่เรียก OCR ซ้ำ"
+        )
+    else:
+        message = (
+            "[Lekza OCR Failed Closed]\n"
+            "รายการนี้ไม่สามารถประมวลผลซ้ำอัตโนมัติได้ "
+            "ห้ามบันทึก Drive/Sheets"
+        )
+    return {"action": "rewrite", "text": message}
+
 def register(ctx):
     def pre_gateway_dispatch_hook(event, gateway=None, session_store=None, **kwargs):
         downloaded_media = False
@@ -544,6 +574,28 @@ def register(ctx):
             # media download, OCR, or any other integration side effect.
             _authorize_runtime_actor(source, gateway)
 
+            try:
+                import lekza_accounting_transaction_buttons as telegram_buttons
+            except ImportError:
+                telegram_buttons = None
+            ingress_enabled = telegram_buttons is not None and all(
+                callable(getattr(telegram_buttons, name, None))
+                for name in (
+                    "lookup_ocr_ingress",
+                    "obtain_ocr_ingress",
+                    "find_ocr_duplicate_candidates",
+                    "complete_ocr_ingress",
+                )
+            )
+            if not ingress_enabled:
+                raise RuntimeError("Durable OCR ingress protection is unavailable")
+            if ingress_enabled:
+                existing_ingress = telegram_buttons.lookup_ocr_ingress(
+                    event, gateway
+                )
+                if existing_ingress is not None and existing_ingress.status != "resume":
+                    return _duplicate_ingress_response(existing_ingress)
+
             log_dir = "/data/logs"
             os.makedirs(log_dir, exist_ok=True)
             log_file = os.path.join(log_dir, "accounting-slip-bridge.log")
@@ -568,7 +620,72 @@ def register(ctx):
                     != Path(source_value).expanduser().resolve()
                 )
 
-            ocr_res = call_akson_ocr(target_path)
+            ingress_outcome = None
+
+            def read_normalized_ocr():
+                result = call_akson_ocr(target_path)
+                if not result.get("akson_called"):
+                    return result
+                normalized = _normalize_ocr_result_for_handoff(result)
+                parsed = normalized["parsed"]
+                if parsed.get("amount") is None:
+                    try:
+                        extracted_amount = call_akson_amount_extraction(target_path)
+                    except Exception:
+                        extracted_amount = None
+                    if extracted_amount is not None:
+                        parsed["amount"] = extracted_amount
+                normalized["akson_called"] = True
+                return normalized
+
+            if ingress_enabled:
+                ingress_outcome = telegram_buttons.obtain_ocr_ingress(
+                    event,
+                    gateway,
+                    source_image_path=target_path,
+                    ocr_reader=read_normalized_ocr,
+                )
+                if ingress_outcome.status != "ready":
+                    with open(log_file, "a", encoding="utf-8") as f:
+                        f.write(json.dumps({
+                            "hook_fired": True,
+                            "platform": platform_val,
+                            "media_is_remote": media_is_remote,
+                            "ingress_status": ingress_outcome.status,
+                        }, ensure_ascii=False) + "\n")
+                    if downloaded_media:
+                        try:
+                            os.remove(target_path)
+                        except OSError:
+                            pass
+                    return _duplicate_ingress_response(ingress_outcome)
+                ocr_res = ingress_outcome.ocr_result
+                candidates = telegram_buttons.find_ocr_duplicate_candidates(
+                    ingress_outcome
+                )
+                exact_reference = next(
+                    (
+                        candidate for candidate in candidates
+                        if "exact_reference" in candidate.get("reasons", ())
+                    ),
+                    None,
+                )
+                if exact_reference is not None:
+                    telegram_buttons.complete_ocr_ingress(
+                        ingress_outcome, exact_reference["transaction_id"]
+                    )
+                    ingress_outcome.transaction_id = exact_reference[
+                        "transaction_id"
+                    ]
+                    ingress_outcome.status = "duplicate"
+                    if downloaded_media:
+                        try:
+                            os.remove(target_path)
+                        except OSError:
+                            pass
+                    return _duplicate_ingress_response(ingress_outcome)
+                if candidates:
+                    ocr_res["duplicate_candidate"] = candidates[0]
             
             # Log OCR result update
             ocr_log = {
@@ -592,11 +709,15 @@ def register(ctx):
                 handoff_error = None
                 transaction_id = None
                 try:
-                    import lekza_accounting_transaction_buttons as telegram_buttons
+                    if telegram_buttons is None:
+                        import lekza_accounting_transaction_buttons as telegram_buttons
 
-                    normalized_ocr_res = _normalize_ocr_result_for_handoff(ocr_res)
+                    normalized_ocr_res = (
+                        ocr_res if ingress_outcome is not None
+                        else _normalize_ocr_result_for_handoff(ocr_res)
+                    )
                     parsed_fields = normalized_ocr_res["parsed"]
-                    if parsed_fields.get("amount") is None:
+                    if ingress_outcome is None and parsed_fields.get("amount") is None:
                         try:
                             extracted_amount = call_akson_amount_extraction(
                                 target_path
@@ -614,6 +735,10 @@ def register(ctx):
                     )
                     transaction_id = handoff["transaction"]["transaction_id"]
                     durable_handoff = True
+                    if ingress_outcome is not None:
+                        telegram_buttons.complete_ocr_ingress(
+                            ingress_outcome, transaction_id
+                        )
                     with open(log_file, "a", encoding="utf-8") as f:
                         f.write(json.dumps({
                             "telegram_transaction_handoff": True,
@@ -621,6 +746,26 @@ def register(ctx):
                             "message_id": message_id,
                         }, ensure_ascii=False) + "\n")
                 except Exception as exc:
+                    if (
+                        ingress_outcome is not None
+                        and getattr(exc, "duplicate_kind", None)
+                        in {"reference", "source"}
+                    ):
+                        existing_transaction_id = getattr(
+                            exc, "existing_transaction_id", None
+                        )
+                        if existing_transaction_id:
+                            telegram_buttons.complete_ocr_ingress(
+                                ingress_outcome, existing_transaction_id
+                            )
+                            ingress_outcome.transaction_id = existing_transaction_id
+                            ingress_outcome.status = "duplicate"
+                        if downloaded_media:
+                            try:
+                                os.remove(target_path)
+                            except OSError:
+                                pass
+                        return _duplicate_ingress_response(ingress_outcome)
                     handoff_error = type(exc).__name__
                     with open(log_file, "a", encoding="utf-8") as f:
                         f.write(json.dumps({

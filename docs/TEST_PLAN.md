@@ -120,6 +120,17 @@ incompatible Hermes adapter detection, and coexistence with non-Lekza Hermes
 callbacks. Prompts are asserted from durable state; Telegram and Google network
 APIs are not called.
 
+## Duplicate slip protection acceptance
+
+Synthetic integration tests verify that Telegram message replay, a new message
+with byte-identical source bytes, concurrent delivery, and process restart each
+produce one OCR call. They also cover tenant-scoped source SHA-256 uniqueness,
+case/space reference normalization, one-character near-reference candidate
+warnings without auto-merge, fail-closed missing references, duplicate-reference
+responses that never fall back to a generic OCR rewrite, and suppression of a
+second transaction/Sheets identity for the same exact source image. Perceptual
+matches are candidate signals only and require corroborating transaction data.
+
 ## Phase D staging acceptance
 
 Use `docs/PHASE_D_STAGING_RUNBOOK.md` only with designated Hostinger staging,

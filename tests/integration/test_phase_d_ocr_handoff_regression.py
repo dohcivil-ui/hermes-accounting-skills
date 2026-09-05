@@ -388,7 +388,16 @@ class PhaseDOcrHandoffRegressionTests(unittest.TestCase):
             "raw_response": api_response,
         }
         handed_off = []
+        def obtain(*args, **kwargs):
+            return types.SimpleNamespace(
+                status="ready", ocr_result=kwargs["ocr_reader"](),
+                transaction_id=None,
+            )
         buttons = types.SimpleNamespace(
+            lookup_ocr_ingress=lambda *args: None,
+            obtain_ocr_ingress=obtain,
+            find_ocr_duplicate_candidates=lambda outcome: [],
+            complete_ocr_ingress=lambda outcome, transaction_id: None,
             handoff_ocr_result=lambda *args, **kwargs: handed_off.append(
                 kwargs["ocr_result"]
             )

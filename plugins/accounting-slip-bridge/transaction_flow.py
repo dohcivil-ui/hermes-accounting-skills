@@ -62,6 +62,7 @@ MUTABLE_STATE_COLUMNS = {
     "retry_count",
     "retry_state",
     "last_error_code",
+    "duplicate_candidate_acknowledged",
 }
 
 
@@ -75,6 +76,22 @@ class AuthorizationError(TransactionStateError):
 
 class DuplicateReferenceError(TransactionStateError):
     """The tenant already has a transaction for this business reference."""
+
+    duplicate_kind = "reference"
+
+    def __init__(self, message, *, existing_transaction_id=None):
+        super().__init__(message)
+        self.existing_transaction_id = existing_transaction_id
+
+
+class DuplicateSlipError(TransactionStateError):
+    """The tenant already has a transaction for these exact source bytes."""
+
+    duplicate_kind = "source"
+
+    def __init__(self, message, *, existing_transaction_id=None):
+        super().__init__(message)
+        self.existing_transaction_id = existing_transaction_id
 
 
 class StaleStateError(TransactionStateError):
@@ -236,6 +253,8 @@ class SQLiteStateStore:
                 session_id TEXT NOT NULL,
                 handoff_key TEXT,
                 telegram_user_id TEXT NOT NULL,
+                source_image_sha256 TEXT,
+                source_perceptual_hash TEXT,
                 reference_no TEXT NOT NULL,
                 reference_no_normalized TEXT NOT NULL,
                 needs_reference INTEGER NOT NULL DEFAULT 0,
@@ -262,6 +281,9 @@ class SQLiteStateStore:
                 initial_prompt_lease_expires_at TEXT,
                 initial_prompt_attempt_count INTEGER NOT NULL DEFAULT 0,
                 initial_prompt_message_id TEXT,
+                duplicate_candidate_transaction_id TEXT,
+                duplicate_candidate_reasons_json TEXT NOT NULL DEFAULT '[]',
+                duplicate_candidate_acknowledged INTEGER NOT NULL DEFAULT 0,
                 retry_count INTEGER NOT NULL DEFAULT 0,
                 retry_state TEXT,
                 last_error_code TEXT,
@@ -312,6 +334,11 @@ class SQLiteStateStore:
             "handoff_key": "TEXT",
             "needs_reference": "INTEGER NOT NULL DEFAULT 0",
             "needs_amount": "INTEGER NOT NULL DEFAULT 0",
+            "source_image_sha256": "TEXT",
+            "source_perceptual_hash": "TEXT",
+            "duplicate_candidate_transaction_id": "TEXT",
+            "duplicate_candidate_reasons_json": "TEXT NOT NULL DEFAULT '[]'",
+            "duplicate_candidate_acknowledged": "INTEGER NOT NULL DEFAULT 0",
         }
         self._connection.execute("BEGIN IMMEDIATE")
         try:
@@ -421,6 +448,14 @@ class SQLiteStateStore:
                 ON transaction_state(handoff_key) WHERE handoff_key IS NOT NULL
                 """
             )
+            self._connection.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS uq_active_source_image
+                ON transaction_state(tenant_id, source_image_sha256)
+                WHERE source_image_sha256 IS NOT NULL
+                  AND current_state <> 'cancelled'
+                """
+            )
             self._connection.commit()
         except Exception:
             self._connection.rollback()
@@ -442,8 +477,24 @@ class SQLiteStateStore:
                 if existing is not None:
                     return existing
             if "reference_no_normalized" in str(exc):
+                existing = self.get_by_reference(
+                    record["tenant_id"], record["reference_no"]
+                )
                 raise DuplicateReferenceError(
-                    "Reference number already exists for this tenant"
+                    "Reference number already exists for this tenant",
+                    existing_transaction_id=(
+                        existing["transaction_id"] if existing else None
+                    ),
+                ) from exc
+            if "source_image_sha256" in str(exc):
+                existing = self.get_by_source_image(
+                    record["tenant_id"], record["source_image_sha256"]
+                )
+                raise DuplicateSlipError(
+                    "Source slip already exists for this tenant",
+                    existing_transaction_id=(
+                        existing["transaction_id"] if existing else None
+                    ),
                 ) from exc
             raise
         return self.get(record["transaction_id"])
@@ -472,6 +523,20 @@ class SQLiteStateStore:
         row = self._connection.execute(
             "SELECT * FROM transaction_state WHERE handoff_key = ?",
             (str(handoff_key),),
+        ).fetchone()
+        return self._decode(row) if row is not None else None
+
+    def get_by_source_image(self, tenant_id, source_image_sha256):
+        digest = str(source_image_sha256 or "").strip().lower()
+        if not digest:
+            return None
+        row = self._connection.execute(
+            """
+            SELECT * FROM transaction_state
+            WHERE tenant_id = ? AND source_image_sha256 = ?
+              AND current_state <> 'cancelled'
+            """,
+            (str(tenant_id), digest),
         ).fetchone()
         return self._decode(row) if row is not None else None
 
@@ -975,6 +1040,12 @@ class SQLiteStateStore:
         record["new_project"] = bool(record["new_project"])
         record["needs_reference"] = bool(record["needs_reference"])
         record["needs_amount"] = bool(record["needs_amount"])
+        record["duplicate_candidate_reasons"] = json.loads(
+            record.pop("duplicate_candidate_reasons_json")
+        )
+        record["duplicate_candidate_acknowledged"] = bool(
+            record["duplicate_candidate_acknowledged"]
+        )
         return record
 
     def close(self):
@@ -1034,6 +1105,26 @@ class TransactionFlow:
     ):
         source_path = self._validate_source_path(source_image_path)
         parsed = dict(ocr_result.get("parsed") or {})
+        source_image_sha256 = str(
+            ocr_result.get("source_image_sha256") or ""
+        ).strip().lower() or None
+        if source_image_sha256 is not None and not re.fullmatch(
+            r"[0-9a-f]{64}", source_image_sha256
+        ):
+            raise ValueError("Source image SHA-256 is invalid")
+        source_perceptual_hash = str(
+            ocr_result.get("source_perceptual_hash") or ""
+        ).strip().lower() or None
+        candidate = ocr_result.get("duplicate_candidate")
+        if not isinstance(candidate, dict):
+            candidate = {}
+        candidate_transaction_id = str(
+            candidate.get("transaction_id") or ""
+        ).strip() or None
+        candidate_reasons = [
+            str(reason) for reason in (candidate.get("reasons") or [])
+            if str(reason).strip()
+        ]
         reference_no = str(parsed.get("reference_no") or "").strip()
         reference_key = _normalize_reference(reference_no)
         needs_reference = not reference_key
@@ -1073,6 +1164,8 @@ class TransactionFlow:
                 "session_id": str(session_id),
                 "handoff_key": None if handoff_key is None else str(handoff_key),
                 "telegram_user_id": str(telegram_user_id),
+                "source_image_sha256": source_image_sha256,
+                "source_perceptual_hash": source_perceptual_hash,
                 "reference_no": reference_no,
                 "reference_no_normalized": reference_key,
                 "needs_reference": 1 if needs_reference else 0,
@@ -1082,6 +1175,11 @@ class TransactionFlow:
                     minimal_fields, ensure_ascii=False, separators=(",", ":")
                 ),
                 "confidence": ocr_result.get("confidence"),
+                "duplicate_candidate_transaction_id": candidate_transaction_id,
+                "duplicate_candidate_reasons_json": json.dumps(
+                    candidate_reasons, ensure_ascii=False, separators=(",", ":")
+                ),
+                "duplicate_candidate_acknowledged": 0,
                 "entry_mode": (
                     "reference" if needs_reference else
                     "amount" if needs_amount else
@@ -1620,7 +1718,12 @@ class TransactionFlow:
                 telegram_user_id=telegram_user_id,
                 expected_version=expected_version,
                 allowed_from={"waiting_review"},
-                changes={"current_state": "confirmed_intent"},
+                changes={
+                    "current_state": "confirmed_intent",
+                    "duplicate_candidate_acknowledged": (
+                        1 if record.get("duplicate_candidate_transaction_id") else 0
+                    ),
+                },
             )
         except StaleStateError:
             concurrent = self._require_authorized(
@@ -1647,6 +1750,13 @@ class TransactionFlow:
         self._require_valid_reference(record)
         self._require_valid_amount(record)
         self._require_valid_date(record)
+        if (
+            record.get("duplicate_candidate_transaction_id")
+            and not record.get("duplicate_candidate_acknowledged")
+        ):
+            raise InvalidTransitionError(
+                "Duplicate candidate requires explicit confirmation"
+            )
         return self._transition_state(
             transaction_id,
             expected_version=expected_version,

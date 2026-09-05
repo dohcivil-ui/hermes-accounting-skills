@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timezone
 import gc
+import hashlib
 import importlib.util
 import json
 import logging
@@ -17,6 +18,7 @@ import time
 
 _PATCH_ATTR = "_lekza_transaction_buttons_v1"
 _CONTROLLER = None
+_INGRESS_LEDGER = None
 _CONTROLLER_LOCK = threading.Lock()
 _MODULE_CACHE = {}
 _LOG = logging.getLogger("lekza.accounting_transaction_buttons")
@@ -91,8 +93,52 @@ def _controller_from_environment():
 
 
 def _set_controller_for_tests(controller):
-    global _CONTROLLER
+    global _CONTROLLER, _INGRESS_LEDGER
     _CONTROLLER = controller
+    desired_path = getattr(
+        getattr(getattr(controller, "_flow", None), "_store", None), "path", None
+    )
+    if (
+        _INGRESS_LEDGER is not None and desired_path is not None
+        and Path(_INGRESS_LEDGER.path) != Path(desired_path)
+    ):
+        _INGRESS_LEDGER.close()
+        _INGRESS_LEDGER = None
+
+
+def _ingress_ledger_from_environment():
+    global _INGRESS_LEDGER
+    environment = dict(os.environ)
+    if not environment.get("LEKZA_TRANSACTION_STATE_DB") and _CONTROLLER is not None:
+        flow = getattr(_CONTROLLER, "_flow", None)
+        store = getattr(flow, "_store", None)
+        path = getattr(store, "path", None)
+        if path:
+            environment["LEKZA_TRANSACTION_STATE_DB"] = str(path)
+    desired_path = Path(
+        str(environment.get("LEKZA_TRANSACTION_STATE_DB") or "")
+    ).expanduser()
+    if (
+        _INGRESS_LEDGER is not None
+        and desired_path.is_absolute()
+        and Path(_INGRESS_LEDGER.path) == desired_path.resolve()
+    ):
+        return _INGRESS_LEDGER
+    with _CONTROLLER_LOCK:
+        if (
+            _INGRESS_LEDGER is not None
+            and desired_path.is_absolute()
+            and Path(_INGRESS_LEDGER.path) == desired_path.resolve()
+        ):
+            return _INGRESS_LEDGER
+        bridge = Path(__file__).resolve().parents[1] / "accounting-slip-bridge"
+        ingress = _load_runtime_module(
+            "lekza_ocr_ingress", bridge / "ocr_ingress.py"
+        )
+        if _INGRESS_LEDGER is not None:
+            _INGRESS_LEDGER.close()
+        _INGRESS_LEDGER = ingress.OcrIngressLedger.from_environment(environment)
+    return _INGRESS_LEDGER
 
 
 def _validate_staging_actor(chat_id, telegram_user_id):
@@ -560,6 +606,68 @@ def _session_id(event, session_store):
     if not message_id:
         raise ValueError("Telegram OCR handoff requires message_id or session store")
     return "telegram-message:" + message_id
+
+
+def _ocr_ingress_identity(event, gateway):
+    source = getattr(event, "source", None)
+    if source is None:
+        raise ValueError("Telegram OCR ingress requires event.source")
+    platform = getattr(source, "platform", None)
+    if hasattr(platform, "value"):
+        platform = platform.value
+    chat_id = str(getattr(source, "chat_id", "") or "")
+    telegram_user_id = str(getattr(source, "user_id", "") or "")
+    message_id = str(getattr(event, "message_id", "") or "")
+    if not chat_id or not telegram_user_id or not message_id:
+        raise ValueError("Telegram OCR ingress requires chat, user, and message identity")
+    bot_id = ""
+    for key, adapter in (getattr(gateway, "adapters", {}) or {}).items():
+        adapter_platform = getattr(key, "value", key)
+        if str(adapter_platform).lower() == "telegram":
+            bot_id = str(getattr(getattr(adapter, "_bot", None), "id", "") or "")
+            break
+    tenant_id = str(os.environ.get("LEKZA_TENANT_ID") or chat_id)
+    payload = {
+        "tenant_id": tenant_id,
+        "platform": str(platform),
+        "bot_id": bot_id,
+        "chat_id": chat_id,
+        "telegram_user_id": telegram_user_id,
+        "message_id": message_id,
+    }
+    message_identity = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return tenant_id, message_identity
+
+
+def lookup_ocr_ingress(event, gateway):
+    tenant_id, message_identity = _ocr_ingress_identity(event, gateway)
+    return _ingress_ledger_from_environment().lookup_message(
+        tenant_id=tenant_id, message_identity=message_identity
+    )
+
+
+def obtain_ocr_ingress(
+    event, gateway, *, source_image_path, ocr_reader
+):
+    tenant_id, message_identity = _ocr_ingress_identity(event, gateway)
+    return _ingress_ledger_from_environment().obtain(
+        tenant_id=tenant_id,
+        message_identity=message_identity,
+        source_image_path=source_image_path,
+        ocr_reader=ocr_reader,
+    )
+
+
+def find_ocr_duplicate_candidates(outcome):
+    return _ingress_ledger_from_environment().find_candidates(outcome)
+
+
+def complete_ocr_ingress(outcome, transaction_id):
+    return _ingress_ledger_from_environment().complete(
+        outcome, transaction_id=transaction_id
+    )
 
 
 async def _deliver_initial_prompt(controller, adapter, record, actor, claim):

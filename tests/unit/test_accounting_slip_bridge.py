@@ -27,6 +27,28 @@ class AccountingSlipBridgeTests(unittest.TestCase):
     def setUp(self):
         self.module = load_module()
 
+    @staticmethod
+    def _buttons_with_ingress(handoff_ocr_result):
+        def obtain(*args, **kwargs):
+            return types.SimpleNamespace(
+                status="ready",
+                ocr_result=kwargs["ocr_reader"](),
+                transaction_id=None,
+            )
+
+        def complete(outcome, transaction_id):
+            outcome.status = "completed"
+            outcome.transaction_id = transaction_id
+            return outcome
+
+        return types.SimpleNamespace(
+            lookup_ocr_ingress=lambda *args: None,
+            obtain_ocr_ingress=obtain,
+            find_ocr_duplicate_candidates=lambda outcome: [],
+            complete_ocr_ingress=complete,
+            handoff_ocr_result=handoff_ocr_result,
+        )
+
     def test_missing_api_key_returns_error_without_network(self):
         with patch.dict(os.environ, {}, clear=True), patch.object(
             self.module.requests, "post"
@@ -300,8 +322,8 @@ class AccountingSlipBridgeTests(unittest.TestCase):
                 message_id="synthetic-message",
             )
             handed_off = []
-            buttons = types.SimpleNamespace(
-                handoff_ocr_result=lambda *args, **kwargs: handed_off.append(
+            buttons = self._buttons_with_ingress(
+                lambda *args, **kwargs: handed_off.append(
                     kwargs["source_image_path"]
                 ) or {"transaction": {"transaction_id": "synthetic-id"}}
             )
@@ -345,8 +367,8 @@ class AccountingSlipBridgeTests(unittest.TestCase):
                 message_id="synthetic-message",
             )
             handed_off = []
-            buttons = types.SimpleNamespace(
-                handoff_ocr_result=lambda *args, **kwargs: handed_off.append(
+            buttons = self._buttons_with_ingress(
+                lambda *args, **kwargs: handed_off.append(
                     kwargs["source_image_path"]
                 ) or {"transaction": {"transaction_id": "synthetic-id"}}
             )
@@ -387,8 +409,8 @@ class AccountingSlipBridgeTests(unittest.TestCase):
                 message_id="synthetic-message",
             )
             handed_off = []
-            buttons = types.SimpleNamespace(
-                handoff_ocr_result=lambda *args, **kwargs: handed_off.append(
+            buttons = self._buttons_with_ingress(
+                lambda *args, **kwargs: handed_off.append(
                     kwargs["ocr_result"]
                 ) or {"transaction": {"transaction_id": "synthetic-id"}}
             )
@@ -421,6 +443,151 @@ class AccountingSlipBridgeTests(unittest.TestCase):
         fallback.assert_called_once_with(str(local_path))
         self.assertEqual(handed_off[0]["parsed"]["amount"], "1250.50")
 
+    def test_duplicate_reference_after_ocr_returns_fail_closed_duplicate(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "staging"
+            environment = self._staging_environment(root)
+            local_path = root / "uploads" / "synthetic.jpg"
+            local_path.parent.mkdir(parents=True)
+            local_path.write_bytes(b"\xff\xd8\xff\xe0synthetic-jpeg")
+            event = types.SimpleNamespace(
+                source=types.SimpleNamespace(
+                    platform="telegram", chat_id="1001", user_id="2001"
+                ),
+                media_urls=[str(local_path)],
+                media_types=["image/jpeg"],
+                message_id="duplicate-reference-message",
+            )
+
+            class DuplicateReferenceError(RuntimeError):
+                duplicate_kind = "reference"
+
+                def __init__(self):
+                    super().__init__("duplicate")
+                    self.existing_transaction_id = "existing-transaction"
+
+            completed = []
+
+            def obtain(*args, **kwargs):
+                return types.SimpleNamespace(
+                    status="ready",
+                    ocr_result=kwargs["ocr_reader"](),
+                    transaction_id=None,
+                )
+
+            buttons = types.SimpleNamespace(
+                lookup_ocr_ingress=lambda *args: None,
+                obtain_ocr_ingress=obtain,
+                find_ocr_duplicate_candidates=lambda outcome: [],
+                complete_ocr_ingress=lambda outcome, transaction_id: completed.append(
+                    transaction_id
+                ),
+                handoff_ocr_result=lambda *args, **kwargs: (_ for _ in ()).throw(
+                    DuplicateReferenceError()
+                ),
+            )
+            gateway = types.SimpleNamespace(adapters={
+                "telegram": types.SimpleNamespace(_bot=types.SimpleNamespace(id="3001"))
+            })
+            with patch.dict(os.environ, environment, clear=True), patch.dict(
+                "sys.modules", {"lekza_accounting_transaction_buttons": buttons}
+            ), patch.object(
+                self.module,
+                "call_akson_ocr",
+                return_value={
+                    "akson_called": True,
+                    "confidence": 0.9,
+                    "parsed": {
+                        "reference_no": "SYNTHETIC-DUPLICATE",
+                        "amount": 100,
+                        "date": "2026-09-05",
+                    },
+                },
+            ), patch.object(self.module.os, "makedirs"), patch(
+                "builtins.open", mock_open()
+            ):
+                result = self._image_hook()(event, gateway=gateway)
+
+        self.assertEqual(completed, ["existing-transaction"])
+        self.assertEqual(result["action"], "rewrite")
+        self.assertIn("Duplicate Slip", result["text"])
+        self.assertNotIn("AksonOCR Slip Result", result["text"])
+
+    def test_unavailable_ingress_guard_fails_closed_before_ocr(self):
+        event = types.SimpleNamespace(
+            source=types.SimpleNamespace(
+                platform="telegram", chat_id="1001", user_id="2001"
+            ),
+            media_urls=["https://example.invalid/slip.jpg"],
+            media_types=["image/jpeg"],
+            message_id="guard-unavailable",
+        )
+        incomplete_buttons = types.SimpleNamespace(handoff_ocr_result=lambda: None)
+        gateway = types.SimpleNamespace(adapters={
+            "telegram": types.SimpleNamespace(_bot=types.SimpleNamespace(id="3001"))
+        })
+        with tempfile.TemporaryDirectory() as temp, patch.dict(
+            os.environ, self._staging_environment(Path(temp)), clear=True
+        ), patch.dict(
+            "sys.modules", {"lekza_accounting_transaction_buttons": incomplete_buttons}
+        ), patch.object(self.module, "call_akson_ocr") as ocr, patch.object(
+            self.module.os, "makedirs"
+        ), patch("builtins.open", mock_open()):
+            result = self._image_hook()(event, gateway=gateway)
+
+        self.assertEqual(result, {"action": "skip"})
+        ocr.assert_not_called()
+
+    def test_exact_reference_candidate_returns_duplicate_without_handoff(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "staging"
+            image_path = root / "uploads" / "synthetic.jpg"
+            image_path.parent.mkdir(parents=True)
+            image_path.write_bytes(b"\xff\xd8\xff\xe0synthetic-jpeg")
+            outcome = types.SimpleNamespace(
+                status="ready", transaction_id=None,
+                ocr_result={"akson_called": True, "parsed": {
+                    "reference_no": "abc123", "amount": 100,
+                }},
+            )
+            completed = []
+            buttons = types.SimpleNamespace(
+                lookup_ocr_ingress=lambda *args: None,
+                obtain_ocr_ingress=lambda *args, **kwargs: outcome,
+                find_ocr_duplicate_candidates=lambda value: [{
+                    "transaction_id": "existing-transaction",
+                    "reasons": ("exact_reference",),
+                }],
+                complete_ocr_ingress=lambda value, transaction_id: completed.append(
+                    transaction_id
+                ),
+                handoff_ocr_result=lambda *args, **kwargs: self.fail(
+                    "duplicate reference must not reach handoff"
+                ),
+            )
+            event = types.SimpleNamespace(
+                source=types.SimpleNamespace(
+                    platform="telegram", chat_id="1001", user_id="2001"
+                ),
+                media_urls=[str(image_path)], media_types=["image/jpeg"],
+                message_id="exact-reference",
+            )
+            gateway = types.SimpleNamespace(adapters={
+                "telegram": types.SimpleNamespace(_bot=types.SimpleNamespace(id="3001"))
+            })
+            with patch.dict(
+                os.environ, self._staging_environment(root), clear=True
+            ), patch.dict(
+                "sys.modules", {"lekza_accounting_transaction_buttons": buttons}
+            ), patch.object(self.module.os, "makedirs"), patch(
+                "builtins.open", mock_open()
+            ):
+                result = self._image_hook()(event, gateway=gateway)
+
+        self.assertEqual(completed, ["existing-transaction"])
+        self.assertEqual(result["action"], "rewrite")
+        self.assertIn("Duplicate Slip", result["text"])
+
     def test_key_extraction_exception_keeps_manual_amount_without_secret_log(self):
         secret_response = "payer=Private Person account=999 amount=9876.54"
         with tempfile.TemporaryDirectory() as temp:
@@ -436,8 +603,8 @@ class AccountingSlipBridgeTests(unittest.TestCase):
                 message_id="synthetic-message",
             )
             handed_off = []
-            buttons = types.SimpleNamespace(
-                handoff_ocr_result=lambda *args, **kwargs: handed_off.append(
+            buttons = self._buttons_with_ingress(
+                lambda *args, **kwargs: handed_off.append(
                     kwargs["ocr_result"]
                 ) or {"transaction": {"transaction_id": "synthetic-id"}}
             )
@@ -485,6 +652,18 @@ class AccountingSlipBridgeTests(unittest.TestCase):
         )
         self.assertEqual(
             ocr_result["parsed"]["reference_no"], " SYNTHETIC-CANONICAL-001 "
+        )
+
+    def test_reference_normalization_ignores_case_and_internal_space(self):
+        spaced = self.module._normalize_ocr_result_for_handoff({
+            "parsed": {"reference_no": " AbC 123 "}
+        })
+        compact = self.module._normalize_ocr_result_for_handoff({
+            "parsed": {"reference_no": "abc123"}
+        })
+        self.assertEqual(
+            spaced["parsed"]["reference_no"].upper(),
+            compact["parsed"]["reference_no"].upper(),
         )
 
     def test_ocr_normalization_uses_fallback_key_or_labeled_text(self):
@@ -568,7 +747,7 @@ class AccountingSlipBridgeTests(unittest.TestCase):
                 handed_off.append(reference_no)
                 return {"transaction": {"transaction_id": "synthetic-id"}}
 
-            buttons = types.SimpleNamespace(handoff_ocr_result=require_reference)
+            buttons = self._buttons_with_ingress(require_reference)
             gateway = types.SimpleNamespace(adapters={
                 "telegram": types.SimpleNamespace(
                     _bot=types.SimpleNamespace(id="3001")
@@ -621,8 +800,8 @@ class AccountingSlipBridgeTests(unittest.TestCase):
                 media_types=["image/jpeg"],
                 message_id="synthetic-message",
             )
-            buttons = types.SimpleNamespace(
-                handoff_ocr_result=lambda *args, **kwargs: (_ for _ in ()).throw(
+            buttons = self._buttons_with_ingress(
+                lambda *args, **kwargs: (_ for _ in ()).throw(
                     ValueError(exception_message)
                 )
             )
@@ -726,7 +905,12 @@ class AccountingSlipBridgeTests(unittest.TestCase):
                     _bot=types.SimpleNamespace(id="3001")
                 )
             })
-            with patch.dict(os.environ, environment, clear=True), patch.object(
+            buttons = self._buttons_with_ingress(
+                lambda *args, **kwargs: self.fail("handoff must not run")
+            )
+            with patch.dict(os.environ, environment, clear=True), patch.dict(
+                "sys.modules", {"lekza_accounting_transaction_buttons": buttons}
+            ), patch.object(
                 self.module, "_materialize_media", return_value=str(local_path)
             ), patch.object(
                 self.module, "call_akson_ocr", side_effect=RuntimeError("synthetic")
@@ -741,7 +925,11 @@ class AccountingSlipBridgeTests(unittest.TestCase):
     def test_remote_media_url_is_not_written_to_diagnostic_log(self):
         secret_url = "https://example.invalid/slip.jpg?credential=secret"
         with tempfile.TemporaryDirectory() as temp:
-            environment = self._staging_environment(Path(temp) / "staging")
+            staging_root = Path(temp) / "staging"
+            environment = self._staging_environment(staging_root)
+            materialized_path = staging_root / "uploads" / "downloaded.jpg"
+            materialized_path.parent.mkdir(parents=True)
+            materialized_path.write_bytes(b"\xff\xd8\xff\xe0synthetic-jpeg")
             event = types.SimpleNamespace(
                 source=types.SimpleNamespace(
                     platform="telegram", chat_id="1001", user_id="2001"
@@ -751,8 +939,13 @@ class AccountingSlipBridgeTests(unittest.TestCase):
                 message_id="synthetic-message",
             )
             opened = mock_open()
-            with patch.dict(os.environ, environment, clear=True), patch.object(
-                self.module, "_materialize_media", return_value=secret_url
+            buttons = self._buttons_with_ingress(
+                lambda *args, **kwargs: self.fail("handoff must not run")
+            )
+            with patch.dict(os.environ, environment, clear=True), patch.dict(
+                "sys.modules", {"lekza_accounting_transaction_buttons": buttons}
+            ), patch.object(
+                self.module, "_materialize_media", return_value=str(materialized_path)
             ) as materialize, patch.object(
                 self.module, "call_akson_ocr", return_value={"error": "synthetic"}
             ), patch.object(self.module.os, "makedirs"), patch(

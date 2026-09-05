@@ -545,11 +545,15 @@ class SavePipelineRestartTests(unittest.TestCase):
         flow = self.flow_module.TransactionFlow(store, allowed_source_roots=[self.root], projects=["Project A"])
         return store, flow
 
-    def advance(self, flow, reference_no="SYNTHETIC-PIPELINE"):
+    def advance(
+        self, flow, reference_no="SYNTHETIC-PIPELINE",
+        source_image_sha256=None,
+    ):
         view = flow.begin(
             tenant_id="tenant-1", thread_id=None, session_id="session-1",
             source_image_path=self.slip,
-            ocr_result={"confidence": 0.9, "parsed": {
+            ocr_result={"confidence": 0.9,
+                        "source_image_sha256": source_image_sha256, "parsed": {
                 "reference_no": reference_no, "amount": "42.50",
                 "date": "2026-08-30", "payer": "Payer", "payee": "Payee", "note": "Fixture",
             }}, **self.actor,
@@ -818,6 +822,46 @@ class SavePipelineRestartTests(unittest.TestCase):
         self.assertEqual(self.sheets_session.batch_calls, 1)
         self.assertEqual(len(self.sheets_session.rows), 2)
         recovered_store.close()
+
+    def test_duplicate_source_hash_never_creates_second_sheets_row(self):
+        store, flow = self.open_flow()
+        try:
+            digest = "b" * 64
+            intent = self.advance(
+                flow, "SYNTHETIC-HASH-FIRST",
+                source_image_sha256=digest,
+            )
+            pipeline = self.adapters.ProductionSavePipeline(
+                flow,
+                self.adapters.GoogleDriveAdapter(
+                    "folder-1", lambda: "token", session=self.drive_session
+                ),
+                self.adapters.GoogleSheetsAdapter(
+                    "sheet-1", lambda: "token", session=self.sheets_session
+                ),
+            )
+            confirmed = pipeline.save(intent["transaction_id"], **self.actor)
+            self.assertEqual(confirmed["current_state"], "confirmed")
+
+            with self.assertRaises(self.flow_module.DuplicateSlipError):
+                flow.begin(
+                    tenant_id="tenant-1", thread_id=None,
+                    session_id="duplicate-source-session",
+                    source_image_path=self.slip,
+                    ocr_result={
+                        "confidence": 0.9,
+                        "source_image_sha256": digest,
+                        "parsed": {
+                            "reference_no": "SYNTHETIC-HASH-SECOND",
+                            "amount": "42.50", "date": "2026-08-30",
+                        },
+                    },
+                    **self.actor,
+                )
+            self.assertEqual(len(self.sheets_session.rows), 2)
+            self.assertEqual(self.sheets_session.batch_calls, 1)
+        finally:
+            store.close()
 
 
 if __name__ == "__main__":

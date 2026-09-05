@@ -421,6 +421,13 @@ class TelegramTransactionController:
             "text": self._prompt_text(record),
             "buttons": buttons,
             "manual_input_required": record.get("entry_mode") is not None,
+            "duplicate_candidate": (
+                {
+                    "transaction_id": record["duplicate_candidate_transaction_id"],
+                    "reasons": tuple(record["duplicate_candidate_reasons"]),
+                }
+                if record.get("duplicate_candidate_transaction_id") else None
+            ),
         }
 
     def _choice(self, identity):
@@ -528,18 +535,24 @@ class TelegramTransactionController:
     @staticmethod
     def _prompt_text(record):
         state = record["current_state"]
+        candidate_warning = ""
+        if record.get("duplicate_candidate_transaction_id"):
+            candidate_warning = (
+                "⚠️ พบรายการเดิมที่คล้ายกัน กรุณาตรวจหมายเลขอ้างอิง "
+                "ยอด วันที่ และคู่โอนก่อนยืนยัน\n"
+            )
         if record.get("needs_reference"):
-            return "พิมพ์หมายเลขอ้างอิงจากสลิปก่อนดำเนินการต่อ"
+            return candidate_warning + "พิมพ์หมายเลขอ้างอิงจากสลิปก่อนดำเนินการต่อ"
         if record.get("needs_amount"):
-            return "กรุณาพิมพ์ยอดเงินที่มากกว่า 0 (รองรับทศนิยม)"
+            return candidate_warning + "กรุณาพิมพ์ยอดเงินที่มากกว่า 0 (รองรับทศนิยม)"
         if record.get("entry_mode") == "date":
-            return "กรุณาพิมพ์วันที่รายการในรูปแบบ YYYY-MM-DD"
+            return candidate_warning + "กรุณาพิมพ์วันที่รายการในรูปแบบ YYYY-MM-DD"
         if state == "waiting_project" and record.get("entry_mode") == "new_project":
-            return "พิมพ์ชื่อโครงการใหม่"
+            return candidate_warning + "พิมพ์ชื่อโครงการใหม่"
         if state == "waiting_project" and record.get("entry_mode") == "manual_entry":
-            return "พิมพ์ชื่อโครงการสำหรับรายการนี้"
+            return candidate_warning + "พิมพ์ชื่อโครงการสำหรับรายการนี้"
         if state == "waiting_category" and record.get("entry_mode") == "category":
-            return "พิมพ์หมวดรายการ"
+            return candidate_warning + "พิมพ์หมวดรายการ"
         labels = {
             "waiting_project": "เลือกโครงการสำหรับรายการนี้",
             "waiting_user": "เลือกผู้ส่งรายการ",
@@ -554,4 +567,4 @@ class TelegramTransactionController:
             "cancelled": "ยกเลิกรายการแล้ว",
             "failed": "บันทึกไม่สำเร็จ สามารถลองใหม่ได้",
         }
-        return labels.get(state, state)
+        return candidate_warning + labels.get(state, state)

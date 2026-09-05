@@ -115,6 +115,7 @@ class SlipPipelineIntegrationTests(unittest.TestCase):
         session_id="session-1",
         amount="1,250.50",
         transaction_date="2026-08-30",
+        source_image_sha256=None,
     ):
         return self.flow.begin(
             tenant_id="tenant-a",
@@ -126,6 +127,7 @@ class SlipPipelineIntegrationTests(unittest.TestCase):
             source_image_path=self.slip_path,
             ocr_result={
                 "confidence": 0.98,
+                "source_image_sha256": source_image_sha256,
                 "parsed": {
                     "reference_no": reference_no,
                     "amount": amount,
@@ -474,6 +476,24 @@ class SlipPipelineIntegrationTests(unittest.TestCase):
             self.begin(" synthetic-duplicate ", "session-duplicate-2")
         pending = self.flow.get_transaction(first["transaction_id"], **self.actor)
         self.assertEqual(pending["current_state"], "waiting_project")
+        self.assertIsNone(pending["drive_file_id"])
+        self.assertIsNone(pending["sheets_row_identity"])
+
+    def test_exact_source_hash_cannot_create_a_second_transaction(self):
+        digest = "a" * 64
+        first = self.begin(
+            "SYNTHETIC-HASH-ONE", "session-hash-1",
+            source_image_sha256=digest,
+        )
+        with self.assertRaises(self.module.DuplicateSlipError) as raised:
+            self.begin(
+                "SYNTHETIC-HASH-TWO", "session-hash-2",
+                source_image_sha256=digest,
+            )
+        self.assertEqual(
+            raised.exception.existing_transaction_id, first["transaction_id"]
+        )
+        pending = self.flow.get_transaction(first["transaction_id"], **self.actor)
         self.assertIsNone(pending["drive_file_id"])
         self.assertIsNone(pending["sheets_row_identity"])
 
