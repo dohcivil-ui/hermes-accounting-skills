@@ -64,6 +64,14 @@ def _project_token(project):
     return hashlib.sha256(str(project).encode("utf-8")).hexdigest()[:12]
 
 
+def _pending_manual_token(pending):
+    identity = "\0".join(
+        str(pending[field])
+        for field in ("typed_value", "input_mode", "created_at")
+    )
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:12]
+
+
 @dataclass(frozen=True)
 class CallbackIdentity:
     transaction_id: str
@@ -80,7 +88,7 @@ def encode_callback(transaction_id, expected_version, action, value_token=None):
     parts = [CALLBACK_PREFIX, transaction_hex, _base36(expected_version), code]
     if value_token is not None:
         token = str(value_token)
-        if code != "p" or not re.fullmatch(r"[0-9a-f]{12}", token):
+        if code not in {"p", "ms"} or not re.fullmatch(r"[0-9a-f]{12}", token):
             raise CallbackPayloadError("Invalid callback value token")
         parts.append(token)
     elif code == "p":
@@ -105,7 +113,9 @@ def decode_callback(payload):
     except (ValueError, OverflowError) as exc:
         raise CallbackPayloadError("Malformed callback payload") from exc
     action = "select_project" if code == "p" else CODE_ACTIONS[code]
-    if (action == "select_project") != (token is not None):
+    if action == "select_project" and token is None:
+        raise CallbackPayloadError("Malformed callback payload")
+    if action not in {"select_project", "select_manual"} and token is not None:
         raise CallbackPayloadError("Malformed callback payload")
     return CallbackIdentity(transaction_id, version, action, token)
 
@@ -175,6 +185,32 @@ class TelegramTransactionController:
         try:
             record = self._flow.get_transaction(identity.transaction_id, **actor)
             if identity.action == "select_manual":
+                pending = self._flow.get_pending_manual_input(**actor)
+                if pending is not None:
+                    pending_token = _pending_manual_token(pending)
+                    if identity.value_token != pending_token:
+                        return self._error("stale_callback")
+                    if record["version"] != identity.expected_version:
+                        self._flow.clear_pending_manual_input(
+                            expected=pending, **actor
+                        )
+                        return self._error("stale_callback")
+                    result = self.handle_manual_input(
+                        identity.transaction_id,
+                        identity.expected_version,
+                        pending["typed_value"],
+                        pending_manual_input=pending,
+                        **actor,
+                    )
+                    if result.get("error_code") in {
+                        "stale_callback", "invalid_transition"
+                    }:
+                        self._flow.clear_pending_manual_input(
+                            expected=pending, **actor
+                        )
+                    return result
+                if identity.value_token is not None:
+                    return self._error("stale_callback")
                 self._flow.select_manual_pending(
                     identity.transaction_id,
                     expected_version=identity.expected_version,
@@ -197,9 +233,11 @@ class TelegramTransactionController:
                     **actor,
                 )
             elif identity.action == "cancel":
+                pending = self._flow.get_pending_manual_input(**actor)
                 self._flow.cancel(
                     identity.transaction_id,
                     expected_version=identity.expected_version,
+                    pending_manual_input=pending,
                     **actor,
                 )
             else:
@@ -224,6 +262,7 @@ class TelegramTransactionController:
         platform,
         chat_id,
         telegram_user_id,
+        pending_manual_input=None,
     ):
         actor = self._actor(platform, chat_id, telegram_user_id)
         try:
@@ -231,6 +270,7 @@ class TelegramTransactionController:
                 transaction_id,
                 expected_version=expected_version,
                 value=text,
+                pending_manual_input=pending_manual_input,
                 **actor,
             )
             self._flow.clear_manual_selection(transaction_id, **actor)
@@ -253,6 +293,12 @@ class TelegramTransactionController:
             record = self._flow.get_manual_pending(**actor)
         except Exception as exc:
             if exc.__class__.__name__ == "MultipleManualPendingError":
+                staged = self._flow.stage_pending_manual_input(text, **actor)
+                if staged:
+                    pending = self._flow.get_pending_manual_input(**actor)
+                    return self._manual_selection_required(
+                        staged, pending=pending
+                    )
                 return self._manual_selection_required(exc.records)
             return self._flow_error(exc)
         if record is None:
@@ -264,7 +310,7 @@ class TelegramTransactionController:
             **actor,
         )
 
-    def _manual_selection_required(self, records):
+    def _manual_selection_required(self, records, pending=None):
         buttons = []
         for record in records:
             reference = str(record.get("reference_no") or "").strip()
@@ -272,7 +318,8 @@ class TelegramTransactionController:
             buttons.append({
                 "label": label,
                 "callback_data": encode_callback(
-                    record["transaction_id"], record["version"], "select_manual"
+                    record["transaction_id"], record["version"], "select_manual",
+                    _pending_manual_token(pending) if pending is not None else None,
                 ),
             })
         return {

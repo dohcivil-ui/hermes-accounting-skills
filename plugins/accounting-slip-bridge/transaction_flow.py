@@ -288,6 +288,15 @@ class SQLiteStateStore:
                 selected_at TEXT NOT NULL,
                 PRIMARY KEY (platform, chat_id, telegram_user_id)
             );
+            CREATE TABLE IF NOT EXISTS pending_manual_input (
+                platform TEXT NOT NULL,
+                chat_id TEXT NOT NULL,
+                telegram_user_id TEXT NOT NULL,
+                typed_value TEXT NOT NULL,
+                input_mode TEXT NOT NULL CHECK (input_mode IN ('date', 'amount')),
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (platform, chat_id, telegram_user_id)
+            );
             """
         )
         self._connection.commit()
@@ -327,6 +336,20 @@ class SQLiteStateStore:
                     transaction_id TEXT NOT NULL,
                     expected_version INTEGER NOT NULL,
                     selected_at TEXT NOT NULL,
+                    PRIMARY KEY (platform, chat_id, telegram_user_id)
+                )
+                """
+            )
+            self._connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS pending_manual_input (
+                    platform TEXT NOT NULL,
+                    chat_id TEXT NOT NULL,
+                    telegram_user_id TEXT NOT NULL,
+                    typed_value TEXT NOT NULL,
+                    input_mode TEXT NOT NULL
+                        CHECK (input_mode IN ('date', 'amount')),
+                    created_at TEXT NOT NULL,
                     PRIMARY KEY (platform, chat_id, telegram_user_id)
                 )
                 """
@@ -509,6 +532,68 @@ class SQLiteStateStore:
             values.append(str(transaction_id))
         with self._connection:
             self._connection.execute(sql, values)
+
+    def set_pending_manual_input(
+        self, typed_value, input_mode, *, platform, chat_id, telegram_user_id
+    ):
+        with self._connection:
+            self._connection.execute(
+                """
+                INSERT INTO pending_manual_input (
+                    platform, chat_id, telegram_user_id, typed_value,
+                    input_mode, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(platform, chat_id, telegram_user_id) DO UPDATE SET
+                    typed_value = excluded.typed_value,
+                    input_mode = excluded.input_mode,
+                    created_at = excluded.created_at
+                """,
+                (
+                    str(platform), str(chat_id), str(telegram_user_id),
+                    str(typed_value), str(input_mode), _utc_now(),
+                ),
+            )
+
+    def get_pending_manual_input(self, *, platform, chat_id, telegram_user_id):
+        row = self._connection.execute(
+            """
+            SELECT platform, chat_id, telegram_user_id, typed_value,
+                   input_mode, created_at
+            FROM pending_manual_input
+            WHERE platform = ? AND chat_id = ? AND telegram_user_id = ?
+            """,
+            (str(platform), str(chat_id), str(telegram_user_id)),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def clear_pending_manual_input(
+        self,
+        *,
+        platform,
+        chat_id,
+        telegram_user_id,
+        expected=None,
+    ):
+        conditions = "platform = ? AND chat_id = ? AND telegram_user_id = ?"
+        parameters = [str(platform), str(chat_id), str(telegram_user_id)]
+        if expected is not None:
+            conditions += (
+                " AND typed_value = ? AND input_mode = ? AND created_at = ?"
+            )
+            parameters.extend([
+                str(expected["typed_value"]),
+                str(expected["input_mode"]),
+                str(expected["created_at"]),
+            ])
+        with self._connection:
+            cursor = self._connection.execute(
+                f"""
+                DELETE FROM pending_manual_input
+                WHERE {conditions}
+                """,
+                tuple(parameters),
+            )
+        return cursor.rowcount == 1
 
     def acquire_initial_prompt_delivery(
         self,
@@ -808,6 +893,8 @@ class SQLiteStateStore:
         expected_version,
         allowed_from,
         changes,
+        pending_manual_input=None,
+        require_pending_manual_input=False,
     ):
         record = self.get(transaction_id)
         if record is None:
@@ -852,8 +939,32 @@ class SQLiteStateStore:
                 """,
                 parameters,
             )
-        if cursor.rowcount != 1:
-            raise StaleStateError("Transaction changed concurrently")
+            if cursor.rowcount != 1:
+                raise StaleStateError("Transaction changed concurrently")
+            if pending_manual_input is not None:
+                pending_actor = (
+                    str(pending_manual_input["platform"]),
+                    str(pending_manual_input["chat_id"]),
+                    str(pending_manual_input["telegram_user_id"]),
+                )
+                if pending_actor != actor:
+                    raise AuthorizationError(
+                        "Pending manual input actor is not authorized"
+                    )
+                deleted = self._connection.execute(
+                    """
+                    DELETE FROM pending_manual_input
+                    WHERE platform = ? AND chat_id = ? AND telegram_user_id = ?
+                      AND typed_value = ? AND input_mode = ? AND created_at = ?
+                    """,
+                    pending_actor + (
+                        str(pending_manual_input["typed_value"]),
+                        str(pending_manual_input["input_mode"]),
+                        str(pending_manual_input["created_at"]),
+                    ),
+                )
+                if require_pending_manual_input and deleted.rowcount != 1:
+                    raise StaleStateError("Pending manual input is stale")
         return self.get(transaction_id)
 
     @staticmethod
@@ -1070,6 +1181,63 @@ class TransactionFlow:
             raise MultipleManualPendingError(records)
         return records[0] if records else None
 
+    def stage_pending_manual_input(
+        self, value, *, platform, chat_id, telegram_user_id
+    ):
+        actor = {
+            "platform": platform, "chat_id": chat_id,
+            "telegram_user_id": telegram_user_id,
+        }
+        records = self._store.list_manual_pending(**actor)
+        manual_value = str(value or "").strip()
+        date_records = [
+            record for record in records if record.get("entry_mode") == "date"
+        ]
+        if date_records:
+            try:
+                _normalized_transaction_date(manual_value)
+            except ValueError:
+                pass
+            else:
+                self._store.set_pending_manual_input(
+                    manual_value, "date", **actor
+                )
+                return date_records
+        amount_records = [
+            record for record in records if record.get("entry_mode") == "amount"
+        ]
+        if amount_records:
+            try:
+                _as_number(manual_value)
+            except ValueError:
+                pass
+            else:
+                self._store.set_pending_manual_input(
+                    manual_value, "amount", **actor
+                )
+                return amount_records
+        return None
+
+    def get_pending_manual_input(self, *, platform, chat_id, telegram_user_id):
+        return self._store.get_pending_manual_input(
+            platform=platform, chat_id=chat_id,
+            telegram_user_id=telegram_user_id,
+        )
+
+    def clear_pending_manual_input(
+        self,
+        *,
+        platform,
+        chat_id,
+        telegram_user_id,
+        expected=None,
+    ):
+        return self._store.clear_pending_manual_input(
+            platform=platform, chat_id=chat_id,
+            telegram_user_id=telegram_user_id,
+            expected=expected,
+        )
+
     def select_manual_pending(
         self, transaction_id, *, expected_version, platform, chat_id,
         telegram_user_id
@@ -1285,12 +1453,33 @@ class TransactionFlow:
         chat_id,
         telegram_user_id,
         value,
+        pending_manual_input=None,
     ):
         record = self._require_authorized(
             transaction_id, platform, chat_id, telegram_user_id
         )
         self._require_current_version(record, expected_version)
+        if pending_manual_input is not None:
+            pending_actor = (
+                str(pending_manual_input["platform"]),
+                str(pending_manual_input["chat_id"]),
+                str(pending_manual_input["telegram_user_id"]),
+            )
+            actor = (str(platform), str(chat_id), str(telegram_user_id))
+            if pending_actor != actor:
+                raise AuthorizationError(
+                    "Pending manual input actor is not authorized"
+                )
+            if record.get("entry_mode") != pending_manual_input["input_mode"]:
+                raise InvalidTransitionError(
+                    "Selected transaction does not match manual input mode"
+                )
         manual_value = str(value or "").strip()
+        if (
+            pending_manual_input is not None
+            and manual_value != str(pending_manual_input["typed_value"])
+        ):
+            raise StaleStateError("Pending manual input value changed")
         if not manual_value:
             raise ValueError("Manual value is required")
         if record["needs_reference"] and record["entry_mode"] == "reference":
@@ -1345,6 +1534,8 @@ class TransactionFlow:
                     "needs_amount": 0,
                     "entry_mode": _date_entry_mode(ocr_fields),
                 },
+                pending_manual_input=pending_manual_input,
+                require_pending_manual_input=pending_manual_input is not None,
             )
             return self._view(updated)
         if record["entry_mode"] == "date":
@@ -1364,6 +1555,8 @@ class TransactionFlow:
                     ),
                     "entry_mode": None,
                 },
+                pending_manual_input=pending_manual_input,
+                require_pending_manual_input=pending_manual_input is not None,
             )
             return self._view(updated)
         if record["current_state"] == "waiting_project" and record[
@@ -1637,6 +1830,7 @@ class TransactionFlow:
         platform,
         chat_id,
         telegram_user_id,
+        pending_manual_input=None,
     ):
         return self._transition_state(
             transaction_id,
@@ -1653,6 +1847,7 @@ class TransactionFlow:
                 "confirmed_intent",
             },
             next_state="cancelled",
+            pending_manual_input=pending_manual_input,
         )
 
     def mark_failed(
@@ -1744,6 +1939,7 @@ class TransactionFlow:
         allowed_from,
         next_state,
         changes=None,
+        pending_manual_input=None,
     ):
         self._require_authorized(
             transaction_id, platform, chat_id, telegram_user_id
@@ -1758,6 +1954,7 @@ class TransactionFlow:
             expected_version=expected_version,
             allowed_from=allowed_from,
             changes=updates,
+            pending_manual_input=pending_manual_input,
         )
         return self._view(updated)
 

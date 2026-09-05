@@ -1,10 +1,12 @@
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import importlib.util
 import json
 import os
 from pathlib import Path
 import sys
 import tempfile
+import threading
 import time
 import types
 import unittest
@@ -172,6 +174,27 @@ class TelegramTransactionWiringTests(unittest.TestCase):
             **self.actor,
         )
 
+    def begin_manual_pending(self, prefix, index, input_mode):
+        parsed = {"reference_no": f"{prefix}-{index}"}
+        if input_mode == "date":
+            parsed["amount"] = 10000
+        elif input_mode == "amount":
+            parsed.update({"amount": None, "date": "2026-08-29"})
+        else:
+            raise ValueError("Unsupported synthetic manual input mode")
+        return self.flow.begin(
+            tenant_id="tenant-test", platform="telegram", chat_id="1001",
+            thread_id=None, session_id=f"{prefix.lower()}-{index}",
+            telegram_user_id="2002", source_image_path=self.slip,
+            ocr_result={"parsed": parsed},
+        )
+
+    def begin_manual_pending_pair(self, prefix, input_mode):
+        return [
+            self.begin_manual_pending(prefix, index, input_mode)
+            for index in range(2)
+        ]
+
     def expire_prompt_lease(self, transaction_id):
         with self.store._connection:
             self.store._connection.execute(
@@ -300,7 +323,272 @@ class TelegramTransactionWiringTests(unittest.TestCase):
             self.flow.get_transaction(item["transaction_id"], **self.actor)
             for item in records
         ]
+        pending = self.flow.get_pending_manual_input(**self.actor)
         self.assertEqual(before, after)
+        self.assertEqual(pending["typed_value"], "100.25")
+        self.assertEqual(pending["input_mode"], "amount")
+        self.assertTrue(pending["created_at"])
+
+    def test_selecting_date_pending_applies_the_typed_value_once(self):
+        records = self.begin_manual_pending_pair("DATE-SELECT", "date")
+        selection = self.controller.handle_manual_message(
+            "2026-08-29", **self.actor
+        )["prompt"]
+        target = records[1]
+
+        selected = self.click(selection, "select_manual", "DATE-SELECT-1")
+        durable = self.flow.get_transaction(target["transaction_id"], **self.actor)
+
+        self.assertTrue(selected["ok"])
+        self.assertEqual(durable["ocr_fields"]["date"], "2026-08-29")
+        self.assertIsNone(durable["entry_mode"])
+        self.assertEqual(selected["prompt"]["current_state"], "waiting_project")
+        self.assertIsNotNone(
+            self.callback(selected["prompt"], "select_project", "Project A")
+        )
+
+    def test_selecting_amount_pending_applies_the_typed_value_once(self):
+        records = self.begin_manual_pending_pair("AMOUNT-SELECT", "amount")
+        selection = self.controller.handle_manual_message("10000", **self.actor)[
+            "prompt"
+        ]
+        target = records[1]
+
+        selected = self.click(selection, "select_manual", "AMOUNT-SELECT-1")
+        durable = self.flow.get_transaction(target["transaction_id"], **self.actor)
+
+        self.assertTrue(selected["ok"])
+        self.assertEqual(durable["ocr_fields"]["amount"], 10000)
+        self.assertFalse(durable["needs_amount"])
+        self.assertIsNone(durable["entry_mode"])
+
+    def test_pending_manual_input_survives_restart_before_selection(self):
+        records = self.begin_manual_pending_pair("PENDING-RESTART", "amount")
+        selection = self.controller.handle_manual_message("88.25", **self.actor)[
+            "prompt"
+        ]
+        payload = self.callback(
+            selection, "select_manual", "PENDING-RESTART-1"
+        )
+
+        restarted_store = self.flow_module.SQLiteStateStore(self.db_path)
+        try:
+            restarted_flow = self.flow_module.TransactionFlow(
+                restarted_store, allowed_source_roots=[self.uploads],
+                projects=["Project A", "Project B"],
+            )
+            restarted = self.wiring.TelegramTransactionController(
+                restarted_flow, FakeSavePipeline(restarted_flow),
+                projects=["Project A", "Project B"],
+            )
+            selected = restarted.handle_callback(payload, **self.actor)
+            durable = restarted_flow.get_transaction(
+                records[1]["transaction_id"], **self.actor
+            )
+
+            self.assertTrue(selected["ok"])
+            self.assertEqual(durable["ocr_fields"]["amount"], 88.25)
+            self.assertFalse(durable["needs_amount"])
+            self.assertIsNone(restarted_flow.get_pending_manual_input(**self.actor))
+        finally:
+            restarted_store.close()
+
+    def test_stale_manual_selection_clears_pending_typed_value(self):
+        records = self.begin_manual_pending_pair("PENDING-STALE", "amount")
+        selection = self.controller.handle_manual_message("77.50", **self.actor)[
+            "prompt"
+        ]
+        target = records[1]
+        payload = self.callback(selection, "select_manual", "PENDING-STALE-1")
+        self.flow.cancel(
+            target["transaction_id"], expected_version=target["version"],
+            **self.actor,
+        )
+
+        stale = self.controller.handle_callback(payload, **self.actor)
+
+        self.assertEqual(stale["error_code"], "stale_callback")
+        self.assertIsNone(self.flow.get_pending_manual_input(**self.actor))
+
+    def test_replayed_manual_selection_does_not_apply_typed_value_twice(self):
+        records = self.begin_manual_pending_pair("PENDING-REPLAY", "amount")
+        selection = self.controller.handle_manual_message("66.25", **self.actor)[
+            "prompt"
+        ]
+        target = records[1]
+        payload = self.callback(selection, "select_manual", "PENDING-REPLAY-1")
+
+        first = self.controller.handle_callback(payload, **self.actor)
+        replay = self.controller.handle_callback(payload, **self.actor)
+        durable = self.flow.get_transaction(target["transaction_id"], **self.actor)
+
+        self.assertTrue(first["ok"])
+        self.assertEqual(replay["error_code"], "stale_callback")
+        self.assertEqual(durable["ocr_fields"]["amount"], 66.25)
+        self.assertEqual(durable["version"], target["version"] + 1)
+        self.assertIsNone(self.flow.get_pending_manual_input(**self.actor))
+
+    def test_pending_value_is_consumed_even_if_prompt_rendering_fails(self):
+        records = self.begin_manual_pending_pair("PENDING-RENDER", "amount")
+        selection = self.controller.handle_manual_message("44.50", **self.actor)[
+            "prompt"
+        ]
+        target = records[1]
+        payload = self.callback(selection, "select_manual", "PENDING-RENDER-1")
+
+        with patch.object(
+            self.controller, "_success", side_effect=RuntimeError("render failed")
+        ):
+            failed = self.controller.handle_callback(payload, **self.actor)
+        durable = self.flow.get_transaction(target["transaction_id"], **self.actor)
+
+        self.assertFalse(failed["ok"])
+        self.assertEqual(durable["ocr_fields"]["amount"], 44.5)
+        self.assertIsNone(self.flow.get_pending_manual_input(**self.actor))
+
+    def test_concurrent_manual_selections_consume_pending_value_once(self):
+        records = self.begin_manual_pending_pair("PENDING-RACE", "amount")
+        selection = self.controller.handle_manual_message("45.75", **self.actor)[
+            "prompt"
+        ]
+        payloads = [
+            self.callback(selection, "select_manual", f"PENDING-RACE-{index}")
+            for index in range(2)
+        ]
+        barrier = threading.Barrier(2)
+
+        def select(payload):
+            store = self.flow_module.SQLiteStateStore(self.db_path)
+            try:
+                flow = self.flow_module.TransactionFlow(
+                    store, allowed_source_roots=[self.uploads],
+                    projects=["Project A", "Project B"],
+                )
+                original_get = flow.get_pending_manual_input
+
+                def synchronized_get(**actor):
+                    pending = original_get(**actor)
+                    barrier.wait(timeout=2)
+                    return pending
+
+                flow.get_pending_manual_input = synchronized_get
+                controller = self.wiring.TelegramTransactionController(
+                    flow, FakeSavePipeline(flow),
+                    projects=["Project A", "Project B"],
+                )
+                return controller.handle_callback(payload, **self.actor)
+            finally:
+                store.close()
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            results = list(executor.map(select, payloads))
+        durable = [
+            self.flow.get_transaction(record["transaction_id"], **self.actor)
+            for record in records
+        ]
+
+        self.assertEqual(sum(result["ok"] for result in results), 1)
+        self.assertEqual(
+            sum(item["ocr_fields"].get("amount") == 45.75 for item in durable),
+            1,
+        )
+        self.assertIsNone(self.flow.get_pending_manual_input(**self.actor))
+
+    def test_stale_selection_does_not_clear_a_newer_pending_value(self):
+        records = [
+            self.begin_manual_pending("PENDING-NEWER", index, "amount")
+            for index in range(3)
+        ]
+        first_selection = self.controller.handle_manual_message(
+            "11.25", **self.actor
+        )["prompt"]
+        old_target = records[2]
+        stale_payload = self.callback(
+            first_selection, "select_manual", "PENDING-NEWER-2"
+        )
+        self.flow.submit_manual(
+            old_target["transaction_id"],
+            expected_version=old_target["version"],
+            value="22.50",
+            **self.actor,
+        )
+        newer_selection = self.controller.handle_manual_message(
+            "33.75", **self.actor
+        )["prompt"]
+
+        stale = self.controller.handle_callback(stale_payload, **self.actor)
+        pending = self.flow.get_pending_manual_input(**self.actor)
+
+        self.assertEqual(stale["error_code"], "stale_callback")
+        self.assertEqual(pending["typed_value"], "33.75")
+        selected = self.click(
+            newer_selection, "select_manual", "PENDING-NEWER-1"
+        )
+        self.assertTrue(selected["ok"])
+
+    def test_wrong_actor_cannot_consume_pending_typed_value(self):
+        records = self.begin_manual_pending_pair("PENDING-ACTOR", "amount")
+        selection = self.controller.handle_manual_message("55.75", **self.actor)[
+            "prompt"
+        ]
+        target = records[1]
+        payload = self.callback(selection, "select_manual", "PENDING-ACTOR-1")
+
+        wrong = self.controller.handle_callback(
+            payload, platform="telegram", chat_id="1001",
+            telegram_user_id="other-user",
+        )
+        owner_pending = self.flow.get_pending_manual_input(**self.actor)
+        selected = self.controller.handle_callback(payload, **self.actor)
+        durable = self.flow.get_transaction(target["transaction_id"], **self.actor)
+
+        self.assertEqual(wrong["error_code"], "unauthorized")
+        self.assertEqual(owner_pending["typed_value"], "55.75")
+        self.assertEqual(owner_pending["input_mode"], "amount")
+        self.assertTrue(selected["ok"])
+        self.assertEqual(durable["ocr_fields"]["amount"], 55.75)
+
+    def test_manual_selection_rejects_pending_input_mode_mismatch(self):
+        self.begin_manual_pending_pair("PENDING-MODE-DATE", "date")
+        amount = self.begin_manual_pending(
+            "PENDING-MODE-AMOUNT", 0, "amount"
+        )
+        selection = self.controller.handle_manual_message(
+            "2026-08-29", **self.actor
+        )["prompt"]
+        pending_token = self.wiring.decode_callback(
+            selection["buttons"][0]["callback_data"]
+        ).value_token
+        mismatched_payload = self.wiring.encode_callback(
+            amount["transaction_id"], amount["version"], "select_manual",
+            pending_token,
+        )
+
+        mismatched = self.controller.handle_callback(
+            mismatched_payload, **self.actor
+        )
+        durable = self.flow.get_transaction(amount["transaction_id"], **self.actor)
+
+        self.assertEqual(mismatched["error_code"], "invalid_transition")
+        self.assertTrue(durable["needs_amount"])
+        self.assertNotIn("amount", durable["ocr_fields"])
+        self.assertIsNone(self.flow.get_pending_manual_input(**self.actor))
+
+    def test_cancel_clears_pending_typed_value(self):
+        records = self.begin_manual_pending_pair("PENDING-CANCEL", "date")
+        target = records[1]
+        cancel_payload = self.callback(
+            self.controller.render(target["transaction_id"], **self.actor),
+            "cancel",
+        )
+        self.controller.handle_manual_message("2026-08-29", **self.actor)
+        self.assertIsNotNone(self.flow.get_pending_manual_input(**self.actor))
+
+        cancelled = self.controller.handle_callback(cancel_payload, **self.actor)
+
+        self.assertTrue(cancelled["ok"])
+        self.assertEqual(cancelled["prompt"]["current_state"], "cancelled")
+        self.assertIsNone(self.flow.get_pending_manual_input(**self.actor))
 
     def test_selected_manual_transaction_survives_restart_and_receives_amount_only(self):
         records = [self.flow.begin(
