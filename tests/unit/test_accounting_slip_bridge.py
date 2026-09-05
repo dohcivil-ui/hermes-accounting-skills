@@ -45,6 +45,7 @@ class AccountingSlipBridgeTests(unittest.TestCase):
             lookup_ocr_ingress=lambda *args: None,
             obtain_ocr_ingress=obtain,
             find_ocr_duplicate_candidates=lambda outcome: [],
+            persist_ocr_ingress_result=lambda outcome: outcome,
             complete_ocr_ingress=complete,
             handoff_ocr_result=handoff_ocr_result,
         )
@@ -670,6 +671,7 @@ class AccountingSlipBridgeTests(unittest.TestCase):
                 lookup_ocr_ingress=lambda *args: None,
                 obtain_ocr_ingress=obtain,
                 find_ocr_duplicate_candidates=lambda outcome: [],
+                persist_ocr_ingress_result=lambda outcome: outcome,
                 complete_ocr_ingress=lambda outcome, transaction_id: completed.append(
                     transaction_id
                 ),
@@ -747,6 +749,7 @@ class AccountingSlipBridgeTests(unittest.TestCase):
                 "duplicate replay must not obtain OCR"
             ),
             find_ocr_duplicate_candidates=lambda outcome: [],
+            persist_ocr_ingress_result=lambda outcome: outcome,
             complete_ocr_ingress=lambda outcome, transaction_id: None,
         )
         with tempfile.TemporaryDirectory() as temp, patch.dict(
@@ -790,6 +793,7 @@ class AccountingSlipBridgeTests(unittest.TestCase):
                 find_ocr_duplicate_candidates=lambda outcome: self.fail(
                     "content duplicate must return before candidate search"
                 ),
+                persist_ocr_ingress_result=lambda outcome: outcome,
                 complete_ocr_ingress=lambda outcome, transaction_id: None,
             )
             event = types.SimpleNamespace(
@@ -862,10 +866,15 @@ class AccountingSlipBridgeTests(unittest.TestCase):
                 })
                 return {"transaction": {"transaction_id": "synthetic-id"}}
 
+            def persist(outcome):
+                events.append("persist")
+                return outcome
+
             buttons = types.SimpleNamespace(
                 lookup_ocr_ingress=lambda *args: None,
                 obtain_ocr_ingress=obtain,
                 find_ocr_duplicate_candidates=find_candidates,
+                persist_ocr_ingress_result=persist,
                 complete_ocr_ingress=lambda outcome, transaction_id: None,
                 handoff_ocr_result=handoff,
             )
@@ -909,7 +918,8 @@ class AccountingSlipBridgeTests(unittest.TestCase):
 
         self.assertEqual(result, {"action": "skip"})
         self.assertEqual(events, [
-            "ocr", "candidate_check", "party_note_extraction", "handoff",
+            "ocr", "candidate_check", "party_note_extraction", "persist",
+            "handoff",
         ])
 
     def test_resumed_ingress_does_not_repeat_party_note_extraction(self):
@@ -934,6 +944,7 @@ class AccountingSlipBridgeTests(unittest.TestCase):
                 lookup_ocr_ingress=lambda *args: resume,
                 obtain_ocr_ingress=lambda *args, **kwargs: outcome,
                 find_ocr_duplicate_candidates=lambda value: [],
+                persist_ocr_ingress_result=lambda value: value,
                 complete_ocr_ingress=lambda value, transaction_id: None,
                 handoff_ocr_result=lambda *args, **kwargs: (
                     handed_off.append(kwargs["ocr_result"])
@@ -994,6 +1005,7 @@ class AccountingSlipBridgeTests(unittest.TestCase):
                     "transaction_id": "existing-transaction",
                     "reasons": ("exact_reference",),
                 }],
+                persist_ocr_ingress_result=lambda value: value,
                 complete_ocr_ingress=lambda value, transaction_id: completed.append(
                     transaction_id
                 ),

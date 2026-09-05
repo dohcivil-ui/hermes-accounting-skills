@@ -834,6 +834,7 @@ def register(ctx):
                     "lookup_ocr_ingress",
                     "obtain_ocr_ingress",
                     "find_ocr_duplicate_candidates",
+                    "persist_ocr_ingress_result",
                     "complete_ocr_ingress",
                 )
             )
@@ -954,6 +955,9 @@ def register(ctx):
                     return _duplicate_ingress_response(ingress_outcome)
                 if ocr_reader_called:
                     _add_extracted_party_note(ocr_res, target_path)
+                    telegram_buttons.persist_ocr_ingress_result(
+                        ingress_outcome
+                    )
                 if candidates:
                     ocr_res["duplicate_candidate"] = candidates[0]
                 if not date_extraction_attempted:

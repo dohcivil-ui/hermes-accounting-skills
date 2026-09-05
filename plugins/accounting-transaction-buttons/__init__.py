@@ -664,6 +664,10 @@ def find_ocr_duplicate_candidates(outcome):
     return _ingress_ledger_from_environment().find_candidates(outcome)
 
 
+def persist_ocr_ingress_result(outcome):
+    return _ingress_ledger_from_environment().persist_result(outcome)
+
+
 def complete_ocr_ingress(outcome, transaction_id):
     return _ingress_ledger_from_environment().complete(
         outcome, transaction_id=transaction_id

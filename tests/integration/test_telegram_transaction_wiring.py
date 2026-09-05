@@ -1703,6 +1703,7 @@ class TelegramTransactionWiringTests(unittest.TestCase):
             lookup_ocr_ingress=lambda *args: None,
             obtain_ocr_ingress=obtain_ingress,
             find_ocr_duplicate_candidates=lambda outcome: [],
+            persist_ocr_ingress_result=lambda outcome: outcome,
             complete_ocr_ingress=lambda outcome, transaction_id: None,
             handoff_ocr_result=handoff_ocr_result,
         )
