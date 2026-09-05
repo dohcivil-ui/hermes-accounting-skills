@@ -45,6 +45,7 @@ class DurableButtonStateTests(unittest.TestCase):
                     "parsed": {
                         "reference_no": "SYNTHETIC-MANUAL-001",
                         "amount": "1000",
+                        "date": "2026-08-30",
                     },
                 },
             )

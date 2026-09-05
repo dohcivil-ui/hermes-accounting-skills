@@ -1,5 +1,7 @@
 import importlib.util
+import json
 from pathlib import Path
+import sqlite3
 import tempfile
 import unittest
 
@@ -107,7 +109,13 @@ class SlipPipelineIntegrationTests(unittest.TestCase):
         self.store.close()
         self.temp_dir.cleanup()
 
-    def begin(self, reference_no="SYNTHETIC-REF-001", session_id="session-1", amount="1,250.50"):
+    def begin(
+        self,
+        reference_no="SYNTHETIC-REF-001",
+        session_id="session-1",
+        amount="1,250.50",
+        transaction_date="2026-08-30",
+    ):
         return self.flow.begin(
             tenant_id="tenant-a",
             platform="telegram",
@@ -121,7 +129,7 @@ class SlipPipelineIntegrationTests(unittest.TestCase):
                 "parsed": {
                     "reference_no": reference_no,
                     "amount": amount,
-                    "date": "2026-08-30",
+                    "date": transaction_date,
                     "payer": "Synthetic Payer",
                     "payee": "Synthetic Payee",
                     "note": "Synthetic fixture",
@@ -206,6 +214,163 @@ class SlipPipelineIntegrationTests(unittest.TestCase):
         exact = self.begin("SYNTHETIC-AMOUNT-EXACT", "session-amount-exact", amount="1,234.50")
         exact_record = self.flow.get_transaction(exact["transaction_id"], **self.actor)
         self.assertEqual(exact_record["ocr_fields"]["amount"], 1234.5)
+
+    def test_missing_or_invalid_date_waits_for_durable_manual_iso_date(self):
+        for index, transaction_date in enumerate(
+            (None, "", "30/08/2026", "2026-02-30")
+        ):
+            with self.subTest(transaction_date=transaction_date):
+                view = self.begin(
+                    f"SYNTHETIC-DATE-{index}",
+                    f"session-date-{index}",
+                    transaction_date=transaction_date,
+                )
+                pending = self.flow.get_manual_pending(**self.actor)
+                self.assertEqual(pending["transaction_id"], view["transaction_id"])
+                self.assertEqual(pending["entry_mode"], "date")
+                with self.assertRaises(self.module.InvalidTransitionError):
+                    self.flow.choose(
+                        view["transaction_id"],
+                        expected_version=view["version"],
+                        action="select_project",
+                        value="Project A",
+                        **self.actor,
+                    )
+                with self.assertRaises(ValueError):
+                    self.flow.submit_manual(
+                        view["transaction_id"],
+                        expected_version=view["version"],
+                        value="01/09/2026",
+                        **self.actor,
+                    )
+
+                updated = self.flow.submit_manual(
+                    view["transaction_id"],
+                    expected_version=view["version"],
+                    value="2026-09-01",
+                    **self.actor,
+                )
+                durable = self.flow.get_transaction(
+                    updated["transaction_id"], **self.actor
+                )
+                self.assertEqual(durable["ocr_fields"]["date"], "2026-09-01")
+                self.assertIsNone(durable["entry_mode"])
+
+    def test_reopens_rc7_rows_with_bad_dates_in_manual_date_flow(self):
+        for suffix, persisted_date in (
+            ("missing-date", None),
+            ("invalid-date", "30/08/2026"),
+        ):
+            with self.subTest(persisted_date=persisted_date):
+                handoff = {
+                    "handoff_id": f"synthetic-handoff-rc7-{suffix}",
+                    "tenant_id": "tenant-a",
+                    "platform": "telegram",
+                    "chat_id": "chat-1",
+                    "thread_id": None,
+                    "session_id": f"session-rc7-{suffix}",
+                    "telegram_user_id": "user-1",
+                    "source_image_path": self.slip_path,
+                    "ocr_result": {
+                        "confidence": 0.98,
+                        "parsed": {
+                            "reference_no": f"SYNTHETIC-RC7-{suffix}",
+                            "amount": "363",
+                            "date": "2026-08-30",
+                            "payer": "Original Synthetic Payer",
+                        },
+                    },
+                }
+                created = self.flow.begin_or_recover(**handoff)
+                original = self.flow.get_transaction(
+                    created["transaction_id"], **self.actor
+                )
+                legacy_fields = dict(original["ocr_fields"])
+                if persisted_date is None:
+                    legacy_fields.pop("date")
+                else:
+                    legacy_fields["date"] = persisted_date
+                connection = sqlite3.connect(self.store.path)
+                try:
+                    connection.execute(
+                        """
+                        UPDATE transaction_state
+                        SET ocr_fields_json = ?, entry_mode = NULL
+                        WHERE transaction_id = ?
+                        """,
+                        (json.dumps(legacy_fields), created["transaction_id"]),
+                    )
+                    connection.commit()
+                finally:
+                    connection.close()
+
+                restarted_store = self.module.SQLiteStateStore(self.store.path)
+                try:
+                    restarted_flow = self.module.TransactionFlow(
+                        restarted_store,
+                        allowed_source_roots=[self.runtime_root],
+                        projects=["Project A"],
+                    )
+                    retried_handoff = dict(handoff)
+                    retried_handoff["ocr_result"] = {
+                        "confidence": 0.01,
+                        "parsed": {
+                            "reference_no": "DO-NOT-MERGE",
+                            "amount": "999",
+                            "date": "2026-09-05",
+                        },
+                    }
+                    recovered = restarted_flow.begin_or_recover(**retried_handoff)
+                    durable = restarted_flow.get_transaction(
+                        recovered["transaction_id"], **self.actor
+                    )
+                    self.assertEqual(
+                        recovered["transaction_id"], created["transaction_id"]
+                    )
+                    self.assertEqual(durable["handoff_key"], original["handoff_key"])
+                    self.assertEqual(
+                        durable["reference_no_normalized"],
+                        original["reference_no_normalized"],
+                    )
+                    self.assertEqual(durable["entry_mode"], "date")
+                    self.assertEqual(durable["ocr_fields"], legacy_fields)
+
+                    updated = restarted_flow.submit_manual(
+                        recovered["transaction_id"],
+                        expected_version=recovered["version"],
+                        value="2026-09-01",
+                        **self.actor,
+                    )
+                    waiting_user = restarted_flow.choose(
+                        updated["transaction_id"],
+                        expected_version=updated["version"],
+                        action="select_project",
+                        value="Project A",
+                        **self.actor,
+                    )
+                    self.assertEqual(waiting_user["current_state"], "waiting_user")
+                finally:
+                    restarted_store.close()
+
+    def test_confirm_fails_closed_when_durable_date_is_missing(self):
+        review = self.advance_to_review("SYNTHETIC-CONFIRM-NO-DATE")
+        durable = self.flow.get_transaction(review["transaction_id"], **self.actor)
+        fields = dict(durable["ocr_fields"])
+        fields.pop("date")
+        invalid = self.store.transition(
+            review["transaction_id"],
+            expected_version=review["version"],
+            allowed_from={"waiting_review"},
+            changes={"ocr_fields_json": json.dumps(fields)},
+            **self.actor,
+        )
+
+        with self.assertRaisesRegex(self.module.InvalidTransitionError, "date"):
+            self.flow.confirm(
+                review["transaction_id"],
+                expected_version=invalid["version"],
+                **self.actor,
+            )
 
     def test_project_selection_supports_back_and_cancel(self):
         view = self.begin()

@@ -166,6 +166,12 @@ class PhaseDOcrHandoffRegressionTests(unittest.TestCase):
         self.assertTrue(supplied["ok"])
         prompt = supplied["prompt"]
         self.assertEqual(prompt["current_state"], "waiting_project")
+        self.assertIn("วันที่", prompt["text"])
+        supplied_date = self.controller.handle_manual_message(
+            "2026-09-01", **actor
+        )
+        self.assertTrue(supplied_date["ok"])
+        prompt = supplied_date["prompt"]
 
         second = self.controller.begin_from_ocr(
             tenant_id="phase-d-missing-reference-tenant",

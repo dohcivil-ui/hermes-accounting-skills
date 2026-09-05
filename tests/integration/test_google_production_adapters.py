@@ -447,6 +447,36 @@ class AdapterTests(unittest.TestCase):
         cells = session.last_batch["requests"][0]["appendCells"]["rows"][0]["values"]
         self.assertEqual(cells[9], {"userEnteredValue": {"numberValue": 1250.5}})
 
+    def test_sheets_normalizes_transaction_date_as_iso_string(self):
+        transaction = self.transaction()
+        transaction["ocr_fields"]["date"] = " 2026-08-30 "
+        session = SheetsSession(self.adapters)
+        adapter = self.adapters.GoogleSheetsAdapter(
+            "sheet-1", lambda: "token", session=session
+        )
+
+        adapter.append_transaction(transaction, write_claim=self.claim())
+
+        cells = session.last_batch["requests"][0]["appendCells"]["rows"][0]["values"]
+        self.assertEqual(
+            cells[2], {"userEnteredValue": {"stringValue": "2026-08-30"}}
+        )
+
+    def test_sheets_rejects_missing_or_invalid_transaction_date_before_write(self):
+        for value in (None, "", "30/08/2026", "2026-02-30"):
+            with self.subTest(value=value):
+                transaction = self.transaction()
+                transaction["ocr_fields"]["date"] = value
+                session = SheetsSession(self.adapters)
+                adapter = self.adapters.GoogleSheetsAdapter(
+                    "sheet-1", lambda: "token", session=session
+                )
+
+                with self.assertRaisesRegex(ValueError, "date"):
+                    adapter.append_transaction(transaction, write_claim=self.claim())
+
+                self.assertEqual(session.batch_calls, 0)
+
     def test_sheets_retry_recovers_existing_row_without_second_append(self):
         session = SheetsSession(self.adapters)
         adapter = self.adapters.GoogleSheetsAdapter("sheet-1", lambda: "token", session=session)

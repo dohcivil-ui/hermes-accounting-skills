@@ -6,7 +6,7 @@ existing OCR result, while later production adapters consume durable state.
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 import hashlib
 import json
@@ -165,6 +165,25 @@ def _as_number(value):
     if not math.isfinite(numeric) or Decimal(str(numeric)) != amount:
         raise ValueError("Amount exceeds safe numeric precision")
     return numeric
+
+
+def _normalized_transaction_date(value):
+    text = str(value or "").strip()
+    try:
+        parsed = date.fromisoformat(text)
+    except ValueError as exc:
+        raise ValueError("Transaction date must be YYYY-MM-DD") from exc
+    if parsed.isoformat() != text:
+        raise ValueError("Transaction date must be YYYY-MM-DD")
+    return parsed.isoformat()
+
+
+def _date_entry_mode(ocr_fields):
+    try:
+        _normalized_transaction_date((ocr_fields or {}).get("date"))
+    except (AttributeError, ValueError):
+        return "date"
+    return None
 
 
 class SQLiteStateStore:
@@ -336,6 +355,26 @@ class SQLiteStateStore:
                         """,
                         (row["transaction_id"],),
                     )
+            for row in self._connection.execute(
+                """
+                SELECT transaction_id, ocr_fields_json
+                FROM transaction_state
+                WHERE needs_reference = 0
+                  AND needs_amount = 0
+                  AND current_state NOT IN ('confirmed', 'cancelled')
+                """
+            ).fetchall():
+                fields = json.loads(row["ocr_fields_json"])
+                if _date_entry_mode(fields) is None:
+                    continue
+                self._connection.execute(
+                    """
+                    UPDATE transaction_state
+                    SET entry_mode = 'date'
+                    WHERE transaction_id = ?
+                    """,
+                    (row["transaction_id"],),
+                )
             self._connection.execute("DROP INDEX IF EXISTS uq_active_reference")
             self._connection.execute(
                 """
@@ -905,6 +944,12 @@ class TransactionFlow:
                 needs_amount = False
             except ValueError:
                 minimal_fields.pop("amount", None)
+        try:
+            minimal_fields["date"] = _normalized_transaction_date(
+                minimal_fields.get("date")
+            )
+        except ValueError:
+            minimal_fields.pop("date", None)
         now = _utc_now()
         transaction_id = str(uuid.uuid4())
         record = self._store.create(
@@ -926,7 +971,11 @@ class TransactionFlow:
                     minimal_fields, ensure_ascii=False, separators=(",", ":")
                 ),
                 "confidence": ocr_result.get("confidence"),
-                "entry_mode": "reference" if needs_reference else ("amount" if needs_amount else None),
+                "entry_mode": (
+                    "reference" if needs_reference else
+                    "amount" if needs_amount else
+                    _date_entry_mode(minimal_fields)
+                ),
                 "current_state": "waiting_project",
                 "created_at": now,
                 "updated_at": now,
@@ -1138,6 +1187,7 @@ class TransactionFlow:
         self._require_current_version(record, expected_version)
         if record.get("needs_amount"):
             raise InvalidTransitionError("Transaction requires a valid amount")
+        self._require_valid_date(record)
         if record["current_state"] == "waiting_project" and action == "select_project":
             if value not in self._projects:
                 raise ValueError("Project is not available")
@@ -1266,7 +1316,10 @@ class TransactionFlow:
                             separators=(",", ":"),
                         ),
                         "needs_reference": 0,
-                        "entry_mode": "amount" if record.get("needs_amount") else None,
+                        "entry_mode": (
+                            "amount" if record.get("needs_amount") else
+                            _date_entry_mode(ocr_fields)
+                        ),
                     },
                 )
             except sqlite3.IntegrityError as exc:
@@ -1290,6 +1343,25 @@ class TransactionFlow:
                         ocr_fields, ensure_ascii=False, separators=(",", ":")
                     ),
                     "needs_amount": 0,
+                    "entry_mode": _date_entry_mode(ocr_fields),
+                },
+            )
+            return self._view(updated)
+        if record["entry_mode"] == "date":
+            transaction_date = _normalized_transaction_date(manual_value)
+            ocr_fields = dict(record["ocr_fields"])
+            ocr_fields["date"] = transaction_date
+            updated = self._store.transition(
+                transaction_id,
+                platform=platform,
+                chat_id=chat_id,
+                telegram_user_id=telegram_user_id,
+                expected_version=expected_version,
+                allowed_from={record["current_state"]},
+                changes={
+                    "ocr_fields_json": json.dumps(
+                        ocr_fields, ensure_ascii=False, separators=(",", ":")
+                    ),
                     "entry_mode": None,
                 },
             )
@@ -1346,6 +1418,7 @@ class TransactionFlow:
             raise InvalidTransitionError("Transaction is not ready for confirmation")
         self._require_valid_reference(record)
         self._require_valid_amount(record)
+        self._require_valid_date(record)
         try:
             updated = self._store.transition(
                 transaction_id,
@@ -1380,6 +1453,7 @@ class TransactionFlow:
         self._require_current_version(record, expected_version)
         self._require_valid_reference(record)
         self._require_valid_amount(record)
+        self._require_valid_date(record)
         return self._transition_state(
             transaction_id,
             expected_version=expected_version,
@@ -1772,6 +1846,17 @@ class TransactionFlow:
         except ValueError as exc:
             raise InvalidTransitionError(
                 "Transaction amount must be greater than zero"
+            ) from exc
+
+    @staticmethod
+    def _require_valid_date(record):
+        try:
+            _normalized_transaction_date(
+                (record.get("ocr_fields") or {}).get("date")
+            )
+        except (AttributeError, ValueError) as exc:
+            raise InvalidTransitionError(
+                "Transaction requires a valid date"
             ) from exc
 
     def _validate_source_path(self, source_image_path):

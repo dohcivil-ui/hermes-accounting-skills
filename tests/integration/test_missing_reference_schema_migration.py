@@ -187,7 +187,7 @@ class MissingReferenceSchemaMigrationTests(unittest.TestCase):
         finally:
             store.close()
 
-    def test_legacy_valid_amount_keeps_state_version_and_entry_mode(self):
+    def test_legacy_valid_amount_keeps_version_and_requests_missing_date(self):
         connection = sqlite3.connect(self.db_path)
         try:
             connection.execute(
@@ -203,7 +203,7 @@ class MissingReferenceSchemaMigrationTests(unittest.TestCase):
             self.assertEqual(record["current_state"], "waiting_review")
             self.assertEqual(record["version"], 7)
             self.assertFalse(record["needs_amount"])
-            self.assertIsNone(record["entry_mode"])
+            self.assertEqual(record["entry_mode"], "date")
             self.assertEqual(record["ocr_fields"]["amount"], 10.25)
         finally:
             store.close()

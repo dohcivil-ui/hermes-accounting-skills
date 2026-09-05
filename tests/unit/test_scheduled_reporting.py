@@ -141,6 +141,47 @@ class PeriodAndAggregationTests(unittest.TestCase):
             {"materials": 3000, "labor": 4500},
         )
 
+    def test_confirmed_transactions_accept_iso_and_google_serial_dates(self):
+        period = self.reporting.current_month_period(
+            datetime(2026, 9, 4, 20, 30, tzinfo=timezone.utc)
+        )
+        report = self.reporting.aggregate_report(
+            "monthly",
+            period,
+            [{"project_id": "p1", "project_name": "บ้านตัวอย่าง"}],
+            [
+                {"date": "2026-09-01", "project_id": "p1", "project": "บ้านตัวอย่าง", "type": "income", "category": "", "amount": 100, "payee": "ลูกค้า", "status": "confirmed"},
+                {"date": 46266, "project_id": "p1", "project": "บ้านตัวอย่าง", "type": "expense", "category": "materials", "amount": 363, "payee": "ร้านวัสดุ", "status": "confirmed"},
+            ],
+        )
+
+        self.assertEqual(report.count, 2)
+        self.assertEqual((report.income, report.expense, report.net), (100, 363, -263))
+
+    def test_report_money_always_has_grouping_and_two_decimal_places(self):
+        period = self.reporting.current_month_period(
+            datetime(2026, 9, 4, 20, 30, tzinfo=timezone.utc)
+        )
+        report = self.reporting.aggregate_report(
+            "monthly",
+            period,
+            [{"project_id": "p1", "project_name": "บ้านตัวอย่าง"}],
+            [
+                {"date": "2026-09-01", "project_id": "p1", "project": "บ้านตัวอย่าง", "type": "income", "category": "", "amount": 10000, "payee": "ลูกค้า", "status": "confirmed"},
+                {"date": "2026-09-02", "project_id": "p1", "project": "บ้านตัวอย่าง", "type": "expense", "category": "labor", "amount": 10000, "payee": "ผู้รับเหมา", "status": "confirmed"},
+                {"date": "2026-09-03", "project_id": "p1", "project": "บ้านตัวอย่าง", "type": "expense", "category": "materials", "amount": 363, "payee": "ร้านวัสดุ", "status": "confirmed"},
+            ],
+        )
+
+        telegram = self.reporting.render_telegram(report)
+        html = self.reporting.render_html(report).decode("utf-8")
+        for rendered in (telegram, html):
+            self.assertIn("10,000.00", rendered)
+            self.assertIn("363.00", rendered)
+            self.assertIn("-363.00", rendered)
+        self.assertIn("จำนวนรายการ: 3", telegram)
+        self.assertNotIn("จำนวนรายการ: 3.00", telegram)
+
     def test_no_data_report_still_renders_all_projects_and_zero_totals(self):
         period = self.reporting.reporting_period(
             "daily", datetime(2026, 9, 3, 14, 0, tzinfo=timezone.utc)
@@ -166,7 +207,10 @@ class PeriodAndAggregationTests(unittest.TestCase):
             [],
         )
         message = self.reporting.render_telegram(report)
-        for label in ("ค่าแรง: 0 บาท", "วัสดุ: 0 บาท", "ค่าเช่า: 0 บาท", "อื่นๆ: 0 บาท"):
+        for label in (
+            "ค่าแรง: 0.00 บาท", "วัสดุ: 0.00 บาท",
+            "ค่าเช่า: 0.00 บาท", "อื่นๆ: 0.00 บาท",
+        ):
             self.assertIn(label, message)
 
     def test_confirmed_malformed_rows_fail_closed(self):

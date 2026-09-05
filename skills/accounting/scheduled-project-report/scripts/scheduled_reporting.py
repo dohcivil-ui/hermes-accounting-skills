@@ -260,6 +260,37 @@ def _amount(value):
     return amount
 
 
+def _transaction_date(value):
+    if isinstance(value, bool):
+        raise MalformedSheetRowError(
+            "Confirmed transaction date must be YYYY-MM-DD or a Google Sheets date serial"
+        )
+    if isinstance(value, (int, float, Decimal)):
+        serial = Decimal(str(value))
+        if not serial.is_finite() or serial != serial.to_integral_value():
+            raise MalformedSheetRowError(
+                "Confirmed transaction date must be YYYY-MM-DD or a Google Sheets date serial"
+            )
+        try:
+            return date(1899, 12, 30) + timedelta(days=int(serial))
+        except (OverflowError, ValueError) as exc:
+            raise MalformedSheetRowError(
+                "Confirmed transaction date must be YYYY-MM-DD or a Google Sheets date serial"
+            ) from exc
+    text = str(value or "").strip()
+    try:
+        parsed = date.fromisoformat(text)
+    except ValueError as exc:
+        raise MalformedSheetRowError(
+            "Confirmed transaction date must be YYYY-MM-DD or a Google Sheets date serial"
+        ) from exc
+    if parsed.isoformat() != text:
+        raise MalformedSheetRowError(
+            "Confirmed transaction date must be YYYY-MM-DD or a Google Sheets date serial"
+        )
+    return parsed
+
+
 def aggregate_report(report_type, period, project_rows, transaction_rows):
     """Aggregate confirmed transactions while preserving every Projects row."""
     projects = []
@@ -284,10 +315,7 @@ def aggregate_report(report_type, period, project_rows, transaction_rows):
             raise MalformedSheetRowError("Transactions.status is unknown")
         if status != "confirmed":
             continue
-        try:
-            transaction_date = date.fromisoformat(str(row.get("date") or ""))
-        except ValueError as exc:
-            raise MalformedSheetRowError("Confirmed transaction date must be YYYY-MM-DD") from exc
+        transaction_date = _transaction_date(row.get("date"))
         if not period.start <= transaction_date <= period.end:
             continue
         transaction_type = row.get("type")
@@ -315,10 +343,7 @@ def aggregate_report(report_type, period, project_rows, transaction_rows):
 
 
 def _money(value):
-    value = Decimal(value)
-    if value == value.to_integral():
-        return f"{int(value):,}"
-    return f"{value:,.2f}"
+    return f"{Decimal(value):,.2f}"
 
 
 def _category_label(value):

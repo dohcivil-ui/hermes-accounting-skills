@@ -316,7 +316,11 @@ class TelegramTransactionController:
                 ),
             })
 
-        if record.get("needs_reference") or record.get("needs_amount"):
+        if (
+            record.get("needs_reference")
+            or record.get("needs_amount")
+            or record.get("entry_mode") == "date"
+        ):
             button("❌ ยกเลิก", "cancel")
         elif state == "waiting_project":
             if record.get("entry_mode") in {"new_project", "manual_entry"}:
@@ -481,6 +485,8 @@ class TelegramTransactionController:
             return "พิมพ์หมายเลขอ้างอิงจากสลิปก่อนดำเนินการต่อ"
         if record.get("needs_amount"):
             return "กรุณาพิมพ์ยอดเงินที่มากกว่า 0 (รองรับทศนิยม)"
+        if record.get("entry_mode") == "date":
+            return "กรุณาพิมพ์วันที่รายการในรูปแบบ YYYY-MM-DD"
         if state == "waiting_project" and record.get("entry_mode") == "new_project":
             return "พิมพ์ชื่อโครงการใหม่"
         if state == "waiting_project" and record.get("entry_mode") == "manual_entry":

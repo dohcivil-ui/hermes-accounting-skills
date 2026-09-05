@@ -108,7 +108,11 @@ class TelegramTransactionWiringTests(unittest.TestCase):
             source_image_path=self.slip,
             ocr_result={
                 "confidence": 0.99,
-                "parsed": {"reference_no": "PHASE-C-001", "amount": "1250.50"},
+                "parsed": {
+                    "reference_no": "PHASE-C-001",
+                    "amount": "1250.50",
+                    "date": "2026-08-30",
+                },
             },
         )
 
@@ -209,7 +213,11 @@ class TelegramTransactionWiringTests(unittest.TestCase):
             tenant_id="tenant-test", platform="telegram", chat_id="1001",
             thread_id=None, session_id="missing-amount", telegram_user_id="2002",
             source_image_path=self.slip,
-            ocr_result={"parsed": {"reference_no": "PHASE-C-NO-AMOUNT", "amount": None}},
+            ocr_result={"parsed": {
+                "reference_no": "PHASE-C-NO-AMOUNT",
+                "amount": None,
+                "date": "2026-08-30",
+            }},
         )
         prompt = self.controller.render(record["transaction_id"], **self.actor)
         self.assertTrue(prompt["manual_input_required"])
@@ -225,6 +233,38 @@ class TelegramTransactionWiringTests(unittest.TestCase):
         valid = self.controller.handle_manual_message("250.75", **self.actor)
         self.assertTrue(valid["ok"])
         self.assertEqual(valid["prompt"]["current_state"], "waiting_project")
+        self.assertEqual(self.pipeline.calls, 0)
+
+    def test_missing_date_prompts_for_manual_iso_date_before_progress(self):
+        record = self.flow.begin(
+            tenant_id="tenant-test", platform="telegram", chat_id="1001",
+            thread_id=None, session_id="missing-date", telegram_user_id="2002",
+            source_image_path=self.slip,
+            ocr_result={"parsed": {
+                "reference_no": "PHASE-C-NO-DATE", "amount": 363,
+            }},
+        )
+
+        prompt = self.controller.render(record["transaction_id"], **self.actor)
+        self.assertTrue(prompt["manual_input_required"])
+        self.assertIn("วันที่", prompt["text"])
+        self.assertEqual(
+            [
+                self.wiring.decode_callback(button["callback_data"]).action
+                for button in prompt["buttons"]
+            ],
+            ["cancel"],
+        )
+        self.assertEqual(self.pipeline.calls, 0)
+
+        invalid = self.controller.handle_manual_message("01/09/2026", **self.actor)
+        self.assertEqual(invalid["error_code"], "validation_error")
+        self.assertEqual(self.pipeline.calls, 0)
+
+        valid = self.controller.handle_manual_message("2026-09-01", **self.actor)
+        self.assertTrue(valid["ok"])
+        self.assertEqual(valid["prompt"]["current_state"], "waiting_project")
+        self.assertFalse(valid["prompt"]["manual_input_required"])
         self.assertEqual(self.pipeline.calls, 0)
 
     def test_multiple_manual_pending_requires_identity_selection_without_mutation(self):
@@ -496,7 +536,11 @@ class TelegramTransactionWiringTests(unittest.TestCase):
             session_id="session-back",
             telegram_user_id="2002",
             source_image_path=self.slip,
-            ocr_result={"parsed": {"reference_no": "PHASE-C-002", "amount": 1}},
+            ocr_result={"parsed": {
+                "reference_no": "PHASE-C-002",
+                "amount": 1,
+                "date": "2026-08-30",
+            }},
         )
         manual = self.controller.render(second["transaction_id"], **self.actor)
         manual = self.click(manual, "manual_project")["prompt"]

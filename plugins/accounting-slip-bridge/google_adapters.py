@@ -6,7 +6,7 @@ and access-token provider so tests never contact external services.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 import json
 import mimetypes
 import os
@@ -49,6 +49,17 @@ CANONICAL_SCHEMAS = {
     "Projects": PROJECTS_SCHEMA,
     "Users": USERS_SCHEMA,
 }
+
+
+def _normalized_transaction_date(value):
+    text = str(value or "").strip()
+    try:
+        parsed = date.fromisoformat(text)
+    except ValueError as exc:
+        raise ValueError("Transaction date must be YYYY-MM-DD") from exc
+    if parsed.isoformat() != text:
+        raise ValueError("Transaction date must be YYYY-MM-DD")
+    return parsed.isoformat()
 
 
 class GoogleAdapterError(RuntimeError):
@@ -443,15 +454,16 @@ class GoogleSheetsAdapter(_GoogleRestAdapter):
     @staticmethod
     def _transaction_row(transaction):
         transaction_id = str(uuid.UUID(str(transaction.get("transaction_id"))))
-        amount = transaction.get("ocr_fields", {}).get("amount")
+        fields = transaction.get("ocr_fields") or {}
+        transaction_date = _normalized_transaction_date(fields.get("date"))
+        amount = fields.get("amount")
         if isinstance(amount, bool) or not isinstance(amount, (int, float)):
             raise ValueError("Transaction amount must be numeric")
         confirmed_at = str(transaction.get("confirmed_at") or datetime.now(timezone.utc).isoformat())
-        fields = transaction.get("ocr_fields") or {}
         values = {
             "transaction_id": transaction_id,
             "reference_no": transaction.get("reference_no", ""),
-            "date": fields.get("date", ""), "payer": fields.get("payer", ""),
+            "date": transaction_date, "payer": fields.get("payer", ""),
             "payee": fields.get("payee", ""), "project_id": transaction.get("project_id", ""),
             "project": transaction.get("project", ""), "type": transaction.get("transaction_type", ""),
             "category": transaction.get("category", ""), "amount": amount,
