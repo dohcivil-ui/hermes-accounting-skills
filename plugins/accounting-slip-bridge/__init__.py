@@ -88,6 +88,36 @@ _AKSON_DATE_EXTRACTION_INSTRUCTIONS = (
     "คืนค่า date เฉพาะเมื่อวันที่ทำรายการชัดเจนเพียงวันที่เดียว "
     "ถ้าไม่ชัดเจนหรือมีหลายวันที่ให้คืนค่าว่าง ห้ามเดา"
 )
+_AKSON_PARTY_NOTE_FIELD_NAMES = ("payer", "payee", "note")
+_AKSON_PARTY_NOTE_CUSTOM_FIELDS = {
+    "payer": {
+        "key": "payer",
+        "description": (
+            "ผู้จ่ายเงินหรือผู้โอนเงินในสลิป "
+            "ถ้าไม่ชัดเจนให้คืนค่าว่าง ห้ามเดา"
+        ),
+    },
+    "payee": {
+        "key": "payee",
+        "description": (
+            "ผู้รับเงินหรือบัญชีปลายทางในสลิป "
+            "ถ้าไม่ชัดเจนให้คืนค่าว่าง ห้ามเดา"
+        ),
+    },
+    "note": {
+        "key": "note",
+        "description": (
+            "ข้อความบันทึกช่วยจำ รายละเอียด หรือวัตถุประสงค์การโอน"
+            "ที่ผู้ทำรายการระบุบนสลิป ห้ามสร้างข้อความใหม่ ห้ามสรุปเอง "
+            "ถ้าไม่มีหรืออ่านไม่ชัดให้คืนค่าว่าง"
+        ),
+    },
+}
+_AKSON_PARTY_NOTE_EXTRACTION_INSTRUCTIONS = (
+    "คืนเฉพาะข้อความที่เห็นชัดเจนบนสลิปสำหรับ field ที่ร้องขอ "
+    "ห้ามเดา ห้ามอนุมานจากชื่อ project หรือ category "
+    "และห้ามสร้างหรือสรุป note; ถ้าไม่มีหรืออ่านไม่ชัดให้คืนค่าว่าง"
+)
 _AMBIGUOUS_STRUCTURED_DATE = "__lekza_ambiguous_structured_date__"
 
 
@@ -232,6 +262,12 @@ def _has_ambiguous_structured_date(ocr_result):
     )
 
 
+def _normalized_party_note_text(value):
+    if not isinstance(value, str):
+        return ""
+    return " ".join(value.split())
+
+
 def _normalize_ocr_result_for_handoff(ocr_result):
     if not isinstance(ocr_result, dict):
         raise ValueError("OCR result must be a mapping")
@@ -271,6 +307,24 @@ def _normalize_ocr_result_for_handoff(ocr_result):
         amount = _amount_from_text(ocr_result)
     if amount is not None:
         parsed["amount"] = amount
+    party_note_mappings = [parsed, ocr_result]
+    if isinstance(raw_response, dict):
+        party_note_mappings.extend((
+            raw_response.get("parsed"),
+            raw_response.get("data"),
+            raw_response,
+        ))
+    for field in _AKSON_PARTY_NOTE_FIELD_NAMES:
+        normalized_text = ""
+        for mapping in party_note_mappings:
+            if isinstance(mapping, dict):
+                normalized_text = _normalized_party_note_text(mapping.get(field))
+                if normalized_text:
+                    break
+        if normalized_text:
+            parsed[field] = normalized_text
+        else:
+            parsed.pop(field, None)
     normalized_date, _ = _structured_date(ocr_result)
     parsed.pop("date", None)
     if normalized_date is not None:
@@ -501,6 +555,80 @@ def call_akson_date_extraction(image_path):
     if not isinstance(data, dict):
         return None
     return data.get("date")
+
+
+def call_akson_party_note_extraction(image_path, fields):
+    """Return requested payer/payee/note strings, or blanks on any failure."""
+    requested_fields = tuple(
+        field for field in _AKSON_PARTY_NOTE_FIELD_NAMES if field in fields
+    )
+    if not requested_fields:
+        return {}
+
+    api_key = os.getenv("AKSONOCR_API_KEY")
+    target_path = str(image_path)
+    if not api_key or not os.path.exists(target_path):
+        return {field: "" for field in requested_fields}
+
+    try:
+        filename = os.path.basename(target_path) or "slip.jpg"
+        with open(target_path, "rb") as stream:
+            response = requests.post(
+                _AKSON_AMOUNT_EXTRACTION_URL,
+                headers={"X-API-Key": api_key},
+                files={"file": (filename, stream, "image/jpeg")},
+                data={
+                    "customFields": json.dumps(
+                        [
+                            _AKSON_PARTY_NOTE_CUSTOM_FIELDS[field]
+                            for field in requested_fields
+                        ],
+                        ensure_ascii=False,
+                    ),
+                    "additionalInstructions": (
+                        _AKSON_PARTY_NOTE_EXTRACTION_INSTRUCTIONS
+                    ),
+                    "model": "AksonOCR-preview",
+                },
+                timeout=_AKSON_AMOUNT_EXTRACTION_TIMEOUT_SECONDS,
+            )
+        if response.status_code >= 300:
+            return {field: "" for field in requested_fields}
+        result = response.json()
+    except Exception:
+        return {field: "" for field in requested_fields}
+
+    data = result.get("data") if isinstance(result, dict) else None
+    if not isinstance(result, dict) or result.get("success") is not True:
+        data = None
+    if not isinstance(data, dict):
+        data = {}
+    return {
+        field: _normalized_party_note_text(data.get(field))
+        for field in requested_fields
+    }
+
+
+def _add_extracted_party_note(ocr_result, image_path):
+    parsed = ocr_result["parsed"]
+    missing_fields = tuple(
+        field for field in _AKSON_PARTY_NOTE_FIELD_NAMES
+        if not _normalized_party_note_text(parsed.get(field))
+    )
+    if not missing_fields:
+        return
+    try:
+        extracted = call_akson_party_note_extraction(
+            image_path, missing_fields
+        )
+    except Exception:
+        extracted = {}
+    if not isinstance(extracted, dict):
+        extracted = {}
+    for field in missing_fields:
+        normalized_text = _normalized_party_note_text(extracted.get(field))
+        if normalized_text:
+            parsed[field] = normalized_text
 
 
 def _add_extracted_date(ocr_result, image_path, *, ambiguous=False):
@@ -744,12 +872,14 @@ def register(ctx):
 
             ingress_outcome = None
             date_extraction_attempted = False
+            ocr_reader_called = False
 
             def read_normalized_ocr():
-                nonlocal date_extraction_attempted
+                nonlocal date_extraction_attempted, ocr_reader_called
                 result = call_akson_ocr(target_path)
                 if not result.get("akson_called"):
                     return result
+                ocr_reader_called = True
                 _, date_ambiguous = _structured_date(result)
                 normalized = _normalize_ocr_result_for_handoff(result)
                 parsed = normalized["parsed"]
@@ -822,6 +952,8 @@ def register(ctx):
                         except OSError:
                             pass
                     return _duplicate_ingress_response(ingress_outcome)
+                if ocr_reader_called:
+                    _add_extracted_party_note(ocr_res, target_path)
                 if candidates:
                     ocr_res["duplicate_candidate"] = candidates[0]
                 if not date_extraction_attempted:
