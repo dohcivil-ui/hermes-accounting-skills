@@ -367,6 +367,39 @@ class OcrIngressLedger:
         outcome.owner_id = None
         return outcome
 
+    def persist_result(self, outcome):
+        if outcome.status != "ready" or not outcome.owner_id:
+            raise ValueError("A ready OCR ingress outcome is required")
+        result = _sanitized_ocr_result(
+            outcome.ocr_result,
+            outcome.content_sha256,
+            outcome.perceptual_hash,
+        )
+        connection = self._connect()
+        try:
+            with connection:
+                cursor = connection.execute(
+                    """
+                    UPDATE ocr_ingress
+                    SET ocr_result_json = ?, updated_at = ?
+                    WHERE ingress_id = ? AND state = 'ready'
+                      AND claim_owner = ?
+                    """,
+                    (
+                        json.dumps(
+                            result, ensure_ascii=False, separators=(",", ":")
+                        ),
+                        _utc_now().isoformat(), outcome.ingress_id,
+                        outcome.owner_id,
+                    ),
+                )
+        finally:
+            connection.close()
+        if cursor.rowcount != 1:
+            raise RuntimeError("OCR ingress result persistence is no longer owned")
+        outcome.ocr_result = result
+        return outcome
+
     def find_candidates(self, outcome):
         if not outcome.ocr_result:
             return []

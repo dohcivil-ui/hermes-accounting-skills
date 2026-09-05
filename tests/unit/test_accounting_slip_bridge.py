@@ -45,6 +45,7 @@ class AccountingSlipBridgeTests(unittest.TestCase):
             lookup_ocr_ingress=lambda *args: None,
             obtain_ocr_ingress=obtain,
             find_ocr_duplicate_candidates=lambda outcome: [],
+            persist_ocr_ingress_result=lambda outcome: outcome,
             complete_ocr_ingress=complete,
             handoff_ocr_result=handoff_ocr_result,
         )
@@ -155,6 +156,166 @@ class AccountingSlipBridgeTests(unittest.TestCase):
         self.assertIn("หลายวันที่", kwargs["data"]["additionalInstructions"])
         self.assertIn("ห้ามเดา", kwargs["data"]["additionalInstructions"])
         self.assertEqual(kwargs["timeout"], 30)
+
+    def _add_party_note_fields(self, parsed, extracted):
+        ocr_result = self.module._normalize_ocr_result_for_handoff({
+            "parsed": dict(parsed)
+        })
+        with patch.object(
+            self.module,
+            "call_akson_party_note_extraction",
+            return_value=extracted,
+        ) as extraction:
+            self.module._add_extracted_party_note(
+                ocr_result, "synthetic-slip.jpg"
+            )
+        return ocr_result["parsed"], extraction
+
+    def _call_party_note_extraction(self, response=None, *, side_effect=None):
+        with tempfile.TemporaryDirectory() as temp:
+            image_path = Path(temp) / "synthetic-slip.jpg"
+            image_path.write_bytes(b"\xff\xd8\xff\xe0synthetic-jpeg")
+            with patch.dict(
+                os.environ,
+                {"AKSONOCR_API_KEY": "synthetic-test-key"},
+                clear=True,
+            ), patch.object(
+                self.module.requests,
+                "post",
+                return_value=response,
+                side_effect=side_effect,
+            ) as post:
+                result = self.module.call_akson_party_note_extraction(
+                    image_path, ("payer", "payee", "note")
+                )
+        return result, post
+
+    def test_structured_payer_is_preserved(self):
+        parsed, extraction = self._add_party_note_fields({
+            "payer": "  Existing   Payer  ",
+            "payee": "Existing Payee",
+            "note": "Existing note",
+        }, {})
+        self.assertEqual(parsed["payer"], "Existing Payer")
+        extraction.assert_not_called()
+
+    def test_structured_payee_is_preserved(self):
+        parsed, extraction = self._add_party_note_fields({
+            "payer": "Existing Payer",
+            "payee": "  Existing   Payee  ",
+            "note": "Existing note",
+        }, {})
+        self.assertEqual(parsed["payee"], "Existing Payee")
+        extraction.assert_not_called()
+
+    def test_structured_note_is_preserved(self):
+        parsed, extraction = self._add_party_note_fields({
+            "payer": "Existing Payer",
+            "payee": "Existing Payee",
+            "note": "  เบิกสำรองค่าแรงชุดปูบล็อค   สนามบิน  ",
+        }, {})
+        self.assertEqual(
+            parsed["note"], "เบิกสำรองค่าแรงชุดปูบล็อค สนามบิน"
+        )
+        extraction.assert_not_called()
+
+    def test_missing_payer_is_extracted(self):
+        parsed, extraction = self._add_party_note_fields(
+            {"payee": "Existing Payee", "note": "Existing note"},
+            {"payer": "Extracted Payer"},
+        )
+        self.assertEqual(parsed["payer"], "Extracted Payer")
+        extraction.assert_called_once_with("synthetic-slip.jpg", ("payer",))
+
+    def test_missing_payee_is_extracted(self):
+        parsed, extraction = self._add_party_note_fields(
+            {"payer": "Existing Payer", "note": "Existing note"},
+            {"payee": "Extracted Payee"},
+        )
+        self.assertEqual(parsed["payee"], "Extracted Payee")
+        extraction.assert_called_once_with("synthetic-slip.jpg", ("payee",))
+
+    def test_missing_note_is_extracted_verbatim_with_whitespace_normalized(self):
+        parsed, extraction = self._add_party_note_fields(
+            {"payer": "Existing Payer", "payee": "Existing Payee"},
+            {"note": "  เบิกสำรองค่าแรงชุดปูบล็อค\n  สนามบิน  "},
+        )
+        self.assertEqual(
+            parsed["note"], "เบิกสำรองค่าแรงชุดปูบล็อค สนามบิน"
+        )
+        extraction.assert_called_once_with("synthetic-slip.jpg", ("note",))
+
+    def test_partial_missing_fields_request_only_missing_custom_fields(self):
+        response = types.SimpleNamespace(
+            status_code=200,
+            json=lambda: {
+                "success": True,
+                "data": {"payee": "Extracted Payee", "note": "Exact note"},
+            },
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            image_path = Path(temp) / "synthetic-slip.jpg"
+            image_path.write_bytes(b"\xff\xd8\xff\xe0synthetic-jpeg")
+            with patch.dict(
+                os.environ,
+                {"AKSONOCR_API_KEY": "synthetic-test-key"},
+                clear=True,
+            ), patch.object(
+                self.module.requests, "post", return_value=response
+            ) as post:
+                result = self.module.call_akson_party_note_extraction(
+                    image_path, ("payee", "note")
+                )
+
+        custom_fields = json.loads(post.call_args.kwargs["data"]["customFields"])
+        self.assertEqual([field["key"] for field in custom_fields], [
+            "payee", "note",
+        ])
+        self.assertEqual(result, {
+            "payee": "Extracted Payee", "note": "Exact note",
+        })
+
+    def test_empty_party_note_response_is_blank_and_fail_open(self):
+        response = types.SimpleNamespace(
+            status_code=200,
+            json=lambda: {"success": True, "data": {}},
+        )
+        result, _ = self._call_party_note_extraction(response)
+        self.assertEqual(result, {"payer": "", "payee": "", "note": ""})
+
+    def test_ambiguous_party_note_response_is_blank_and_fail_open(self):
+        response = types.SimpleNamespace(
+            status_code=200,
+            json=lambda: {
+                "success": True,
+                "data": {
+                    "payer": ["First", "Second"],
+                    "payee": {"ambiguous": True},
+                    "note": None,
+                },
+            },
+        )
+        result, _ = self._call_party_note_extraction(response)
+        self.assertEqual(result, {"payer": "", "payee": "", "note": ""})
+
+    def test_malformed_party_note_response_is_blank_and_fail_open(self):
+        response = types.SimpleNamespace(status_code=200, json=lambda: [])
+        result, _ = self._call_party_note_extraction(response)
+        self.assertEqual(result, {"payer": "", "payee": "", "note": ""})
+
+    def test_non_2xx_party_note_response_is_blank_and_fail_open(self):
+        response = types.SimpleNamespace(
+            status_code=500,
+            text="synthetic private provider payload",
+        )
+        result, _ = self._call_party_note_extraction(response)
+        self.assertEqual(result, {"payer": "", "payee": "", "note": ""})
+
+    def test_party_note_exception_is_blank_and_fail_open(self):
+        result, _ = self._call_party_note_extraction(
+            side_effect=RuntimeError("synthetic private provider payload")
+        )
+        self.assertEqual(result, {"payer": "", "payee": "", "note": ""})
 
     def _staging_environment(self, root):
         return {
@@ -510,6 +671,7 @@ class AccountingSlipBridgeTests(unittest.TestCase):
                 lookup_ocr_ingress=lambda *args: None,
                 obtain_ocr_ingress=obtain,
                 find_ocr_duplicate_candidates=lambda outcome: [],
+                persist_ocr_ingress_result=lambda outcome: outcome,
                 complete_ocr_ingress=lambda outcome, transaction_id: completed.append(
                     transaction_id
                 ),
@@ -587,6 +749,7 @@ class AccountingSlipBridgeTests(unittest.TestCase):
                 "duplicate replay must not obtain OCR"
             ),
             find_ocr_duplicate_candidates=lambda outcome: [],
+            persist_ocr_ingress_result=lambda outcome: outcome,
             complete_ocr_ingress=lambda outcome, transaction_id: None,
         )
         with tempfile.TemporaryDirectory() as temp, patch.dict(
@@ -595,6 +758,9 @@ class AccountingSlipBridgeTests(unittest.TestCase):
             "sys.modules", {"lekza_accounting_transaction_buttons": buttons}
         ), patch.object(self.module, "_materialize_media") as materialize, \
                 patch.object(self.module, "call_akson_ocr") as ocr, \
+                patch.object(
+                    self.module, "call_akson_party_note_extraction"
+                ) as party_note_extraction, \
                 patch.object(
                     self.module, "call_akson_date_extraction"
                 ) as date_extraction:
@@ -611,7 +777,211 @@ class AccountingSlipBridgeTests(unittest.TestCase):
         self.assertIn("Duplicate Slip", result["text"])
         materialize.assert_not_called()
         ocr.assert_not_called()
+        party_note_extraction.assert_not_called()
         date_extraction.assert_not_called()
+
+    def test_content_duplicate_returns_before_party_note_extraction(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "staging"
+            image_path = root / "uploads" / "synthetic.jpg"
+            duplicate = types.SimpleNamespace(
+                status="duplicate", transaction_id="existing-transaction"
+            )
+            buttons = types.SimpleNamespace(
+                lookup_ocr_ingress=lambda *args: None,
+                obtain_ocr_ingress=lambda *args, **kwargs: duplicate,
+                find_ocr_duplicate_candidates=lambda outcome: self.fail(
+                    "content duplicate must return before candidate search"
+                ),
+                persist_ocr_ingress_result=lambda outcome: outcome,
+                complete_ocr_ingress=lambda outcome, transaction_id: None,
+            )
+            event = types.SimpleNamespace(
+                source=types.SimpleNamespace(
+                    platform="telegram", chat_id="1001", user_id="2001"
+                ),
+                media_urls=[str(image_path)], media_types=["image/jpeg"],
+                message_id="content-duplicate",
+            )
+            gateway = types.SimpleNamespace(adapters={
+                "telegram": types.SimpleNamespace(
+                    _bot=types.SimpleNamespace(id="3001")
+                )
+            })
+            with patch.dict(
+                os.environ, self._staging_environment(root), clear=True
+            ), patch.dict(
+                "sys.modules", {"lekza_accounting_transaction_buttons": buttons}
+            ), patch.object(
+                self.module, "_materialize_media", return_value=str(image_path)
+            ), patch.object(
+                self.module, "call_akson_ocr"
+            ) as ocr, patch.object(
+                self.module, "call_akson_party_note_extraction"
+            ) as party_note_extraction, patch.object(
+                self.module.os, "makedirs"
+            ), patch("builtins.open", mock_open()):
+                result = self._image_hook()(event, gateway=gateway)
+
+        self.assertEqual(result["action"], "rewrite")
+        self.assertIn("Duplicate Slip", result["text"])
+        ocr.assert_not_called()
+        party_note_extraction.assert_not_called()
+
+    def test_party_note_fallback_runs_after_candidate_check_before_handoff(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "staging"
+            image_path = root / "uploads" / "synthetic.jpg"
+            events = []
+
+            def obtain(*args, **kwargs):
+                return types.SimpleNamespace(
+                    status="ready",
+                    transaction_id=None,
+                    ocr_result=kwargs["ocr_reader"](),
+                )
+
+            def find_candidates(outcome):
+                events.append("candidate_check")
+                return []
+
+            def extract_party_note(path, fields):
+                events.append("party_note_extraction")
+                self.assertEqual(fields, ("payer", "payee", "note"))
+                return {
+                    "payer": "Extracted Payer",
+                    "payee": "Extracted Payee",
+                    "note": "Exact note",
+                }
+
+            def handoff(*args, **kwargs):
+                events.append("handoff")
+                self.assertEqual(kwargs["ocr_result"]["parsed"], {
+                    "reference_no": "SYNTHETIC-REF",
+                    "amount": 100,
+                    "date": "2026-09-05",
+                    "payer": "Extracted Payer",
+                    "payee": "Extracted Payee",
+                    "note": "Exact note",
+                })
+                return {"transaction": {"transaction_id": "synthetic-id"}}
+
+            def persist(outcome):
+                events.append("persist")
+                return outcome
+
+            buttons = types.SimpleNamespace(
+                lookup_ocr_ingress=lambda *args: None,
+                obtain_ocr_ingress=obtain,
+                find_ocr_duplicate_candidates=find_candidates,
+                persist_ocr_ingress_result=persist,
+                complete_ocr_ingress=lambda outcome, transaction_id: None,
+                handoff_ocr_result=handoff,
+            )
+            event = types.SimpleNamespace(
+                source=types.SimpleNamespace(
+                    platform="telegram", chat_id="1001", user_id="2001"
+                ),
+                media_urls=[str(image_path)], media_types=["image/jpeg"],
+                message_id="party-note-order",
+            )
+            gateway = types.SimpleNamespace(adapters={
+                "telegram": types.SimpleNamespace(
+                    _bot=types.SimpleNamespace(id="3001")
+                )
+            })
+            with patch.dict(
+                os.environ, self._staging_environment(root), clear=True
+            ), patch.dict(
+                "sys.modules", {"lekza_accounting_transaction_buttons": buttons}
+            ), patch.object(
+                self.module, "_materialize_media", return_value=str(image_path)
+            ), patch.object(
+                self.module,
+                "call_akson_ocr",
+                side_effect=lambda path: events.append("ocr") or {
+                    "akson_called": True,
+                    "parsed": {
+                        "reference_no": "SYNTHETIC-REF",
+                        "amount": 100,
+                        "date": "2026-09-05",
+                    },
+                },
+            ), patch.object(
+                self.module,
+                "call_akson_party_note_extraction",
+                side_effect=extract_party_note,
+            ), patch.object(
+                self.module.os, "makedirs"
+            ), patch("builtins.open", mock_open()):
+                result = self._image_hook()(event, gateway=gateway)
+
+        self.assertEqual(result, {"action": "skip"})
+        self.assertEqual(events, [
+            "ocr", "candidate_check", "party_note_extraction", "persist",
+            "handoff",
+        ])
+
+    def test_resumed_ingress_does_not_repeat_party_note_extraction(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "staging"
+            image_path = root / "uploads" / "synthetic.jpg"
+            resume = types.SimpleNamespace(status="resume")
+            outcome = types.SimpleNamespace(
+                status="ready",
+                transaction_id=None,
+                ocr_result={
+                    "akson_called": True,
+                    "parsed": {
+                        "reference_no": "SYNTHETIC-REF",
+                        "amount": 100,
+                        "date": "2026-09-05",
+                    },
+                },
+            )
+            handed_off = []
+            buttons = types.SimpleNamespace(
+                lookup_ocr_ingress=lambda *args: resume,
+                obtain_ocr_ingress=lambda *args, **kwargs: outcome,
+                find_ocr_duplicate_candidates=lambda value: [],
+                persist_ocr_ingress_result=lambda value: value,
+                complete_ocr_ingress=lambda value, transaction_id: None,
+                handoff_ocr_result=lambda *args, **kwargs: (
+                    handed_off.append(kwargs["ocr_result"])
+                    or {"transaction": {"transaction_id": "synthetic-id"}}
+                ),
+            )
+            event = types.SimpleNamespace(
+                source=types.SimpleNamespace(
+                    platform="telegram", chat_id="1001", user_id="2001"
+                ),
+                media_urls=[str(image_path)], media_types=["image/jpeg"],
+                message_id="resumed-ingress",
+            )
+            gateway = types.SimpleNamespace(adapters={
+                "telegram": types.SimpleNamespace(
+                    _bot=types.SimpleNamespace(id="3001")
+                )
+            })
+            with patch.dict(
+                os.environ, self._staging_environment(root), clear=True
+            ), patch.dict(
+                "sys.modules", {"lekza_accounting_transaction_buttons": buttons}
+            ), patch.object(
+                self.module, "_materialize_media", return_value=str(image_path)
+            ), patch.object(
+                self.module, "call_akson_ocr"
+            ) as ocr, patch.object(
+                self.module, "call_akson_party_note_extraction"
+            ) as party_note_extraction, patch.object(
+                self.module.os, "makedirs"
+            ), patch("builtins.open", mock_open()):
+                result = self._image_hook()(event, gateway=gateway)
+
+        self.assertEqual(result, {"action": "skip"})
+        self.assertEqual(len(handed_off), 1)
+        ocr.assert_not_called()
+        party_note_extraction.assert_not_called()
 
     def test_exact_reference_candidate_returns_duplicate_without_handoff(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -619,20 +989,23 @@ class AccountingSlipBridgeTests(unittest.TestCase):
             image_path = root / "uploads" / "synthetic.jpg"
             image_path.parent.mkdir(parents=True)
             image_path.write_bytes(b"\xff\xd8\xff\xe0synthetic-jpeg")
-            outcome = types.SimpleNamespace(
-                status="ready", transaction_id=None,
-                ocr_result={"akson_called": True, "parsed": {
-                    "reference_no": "abc123", "amount": 100,
-                }},
-            )
             completed = []
+
+            def obtain(*args, **kwargs):
+                return types.SimpleNamespace(
+                    status="ready",
+                    transaction_id=None,
+                    ocr_result=kwargs["ocr_reader"](),
+                )
+
             buttons = types.SimpleNamespace(
                 lookup_ocr_ingress=lambda *args: None,
-                obtain_ocr_ingress=lambda *args, **kwargs: outcome,
+                obtain_ocr_ingress=obtain,
                 find_ocr_duplicate_candidates=lambda value: [{
                     "transaction_id": "existing-transaction",
                     "reasons": ("exact_reference",),
                 }],
+                persist_ocr_ingress_result=lambda value: value,
                 complete_ocr_ingress=lambda value, transaction_id: completed.append(
                     transaction_id
                 ),
@@ -654,14 +1027,34 @@ class AccountingSlipBridgeTests(unittest.TestCase):
                 os.environ, self._staging_environment(root), clear=True
             ), patch.dict(
                 "sys.modules", {"lekza_accounting_transaction_buttons": buttons}
-            ), patch.object(self.module.os, "makedirs"), patch(
-                "builtins.open", mock_open()
-            ):
+            ), patch.object(
+                self.module,
+                "call_akson_ocr",
+                return_value={
+                    "akson_called": True,
+                    "parsed": {
+                        "reference_no": "abc123",
+                        "amount": 100,
+                        "date": "2026-09-05",
+                    },
+                },
+            ), patch.object(
+                self.module, "call_akson_party_note_extraction"
+            ) as party_note_extraction, patch.object(
+                self.module, "call_akson_amount_extraction"
+            ) as amount_extraction, patch.object(
+                self.module, "call_akson_date_extraction"
+            ) as date_extraction, patch.object(
+                self.module.os, "makedirs"
+            ), patch("builtins.open", mock_open()):
                 result = self._image_hook()(event, gateway=gateway)
 
         self.assertEqual(completed, ["existing-transaction"])
         self.assertEqual(result["action"], "rewrite")
         self.assertIn("Duplicate Slip", result["text"])
+        party_note_extraction.assert_not_called()
+        amount_extraction.assert_not_called()
+        date_extraction.assert_not_called()
 
     def test_key_extraction_exception_keeps_manual_amount_without_secret_log(self):
         secret_response = "payer=Private Person account=999 amount=9876.54"

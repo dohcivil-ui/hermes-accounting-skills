@@ -474,6 +474,9 @@ class PhaseDOcrHandoffRegressionTests(unittest.TestCase):
             lookup_ocr_ingress=lookup,
             obtain_ocr_ingress=obtain,
             find_ocr_duplicate_candidates=find_candidates,
+            persist_ocr_ingress_result=lambda outcome: (
+                ingress_ledger.persist_result(outcome)
+            ),
             complete_ocr_ingress=lambda outcome, transaction_id: (
                 ingress_ledger.complete(
                     outcome, transaction_id=transaction_id
@@ -581,6 +584,182 @@ class PhaseDOcrHandoffRegressionTests(unittest.TestCase):
         self.assertEqual(durable["entry_mode"], "date")
         self.assertNotIn("date", durable["ocr_fields"])
 
+    def test_party_note_enrichment_persists_across_crash_before_handoff(self):
+        ingress_module = load_module(
+            "lekza_phase_d_party_note_ingress", INGRESS_PATH
+        )
+        ingress_ledger = ingress_module.OcrIngressLedger(
+            self.root / "party-note-ingress.sqlite3"
+        )
+        ingress_identity = {
+            "tenant_id": "phase-d-party-note-resume-tenant",
+            "message_identity": "phase-d-party-note-resume-message",
+        }
+        handoff_attempts = {"count": 0}
+
+        def lookup(*args):
+            return ingress_ledger.lookup_message(**ingress_identity)
+
+        def obtain(*args, **kwargs):
+            return ingress_ledger.obtain(
+                **ingress_identity,
+                source_image_path=kwargs["source_image_path"],
+                ocr_reader=kwargs["ocr_reader"],
+            )
+
+        def handoff_ocr_result(
+            event, gateway, session_store, *, source_image_path, ocr_result
+        ):
+            handoff_attempts["count"] += 1
+            if handoff_attempts["count"] == 1:
+                raise RuntimeError("synthetic crash before durable handoff")
+            transaction = self.controller.begin_from_ocr(
+                tenant_id="phase-d-party-note-resume-tenant",
+                chat_id="phase-d-synthetic-chat",
+                thread_id=None,
+                session_id="phase-d-party-note-resume-session",
+                handoff_id="phase-d-party-note-resume-message",
+                telegram_user_id="phase-d-synthetic-user",
+                source_image_path=source_image_path,
+                ocr_result=ocr_result,
+            )
+            return {"transaction": transaction}
+
+        buttons = types.SimpleNamespace(
+            lookup_ocr_ingress=lookup,
+            obtain_ocr_ingress=obtain,
+            find_ocr_duplicate_candidates=lambda outcome: [],
+            persist_ocr_ingress_result=lambda outcome: (
+                ingress_ledger.persist_result(outcome)
+            ),
+            complete_ocr_ingress=lambda outcome, transaction_id: (
+                ingress_ledger.complete(
+                    outcome, transaction_id=transaction_id
+                )
+            ),
+            handoff_ocr_result=handoff_ocr_result,
+        )
+        event = types.SimpleNamespace(
+            source=types.SimpleNamespace(
+                platform="telegram",
+                chat_id="phase-d-synthetic-chat",
+                user_id="phase-d-synthetic-user",
+            ),
+            media_urls=[str(self.slip)],
+            media_types=["image/jpeg"],
+            message_id="phase-d-party-note-resume-message",
+        )
+
+        first_context = types.SimpleNamespace(hooks={})
+        first_context.register_hook = (
+            lambda name, callback: first_context.hooks.__setitem__(name, callback)
+        )
+        self.bridge.register(first_context)
+        with patch.dict(
+            os.environ, {"LEKZA_RUNTIME_ENV": "production"}, clear=True
+        ), patch.dict(
+            sys.modules, {"lekza_accounting_transaction_buttons": buttons}
+        ), patch.object(
+            self.bridge, "_materialize_media", return_value=str(self.slip)
+        ), patch.object(
+            self.bridge,
+            "call_akson_ocr",
+            return_value={
+                "akson_called": True,
+                "confidence": 1.0,
+                "parsed": {
+                    "reference_no": "PARTY-NOTE-RESUME",
+                    "amount": "1.00",
+                    "date": "2026-09-05",
+                },
+            },
+        ) as first_ocr, patch.object(
+            self.bridge,
+            "call_akson_party_note_extraction",
+            return_value={
+                "payer": "Synthetic Extracted Payer",
+                "payee": "Synthetic Extracted Payee",
+                "note": "Synthetic extracted note",
+            },
+        ) as party_note_fallback, patch.object(
+            self.bridge.os, "makedirs"
+        ), patch(
+            "builtins.open", mock_open()
+        ):
+            first_result = first_context.hooks["pre_gateway_dispatch"](event)
+
+        self.assertEqual(first_result["action"], "rewrite")
+        first_ocr.assert_called_once()
+        party_note_fallback.assert_called_once_with(
+            str(self.slip), ("payer", "payee", "note")
+        )
+        connection = ingress_ledger._connect()
+        try:
+            persisted = json.loads(connection.execute(
+                "SELECT ocr_result_json FROM ocr_ingress"
+            ).fetchone()["ocr_result_json"])
+            self.assertEqual(persisted["parsed"], {
+                "reference_no": "PARTY-NOTE-RESUME",
+                "amount": "1.00",
+                "date": "2026-09-05",
+                "payer": "Synthetic Extracted Payer",
+                "payee": "Synthetic Extracted Payee",
+                "note": "Synthetic extracted note",
+            })
+            with connection:
+                connection.execute(
+                    "UPDATE ocr_ingress SET claim_expires_at = ?",
+                    ("2000-01-01T00:00:00+00:00",),
+                )
+        finally:
+            connection.close()
+
+        restarted_bridge = load_module(
+            "lekza_phase_d_party_note_restart_bridge", BRIDGE_PATH
+        )
+        restarted_context = types.SimpleNamespace(hooks={})
+        restarted_context.register_hook = (
+            lambda name, callback: restarted_context.hooks.__setitem__(
+                name, callback
+            )
+        )
+        restarted_bridge.register(restarted_context)
+        resumed_handoffs = []
+        original_handoff = buttons.handoff_ocr_result
+
+        def capture_resumed_handoff(*args, **kwargs):
+            resumed_handoffs.append(kwargs["ocr_result"])
+            return original_handoff(*args, **kwargs)
+
+        buttons.handoff_ocr_result = capture_resumed_handoff
+        with patch.dict(
+            os.environ, {"LEKZA_RUNTIME_ENV": "production"}, clear=True
+        ), patch.dict(
+            sys.modules, {"lekza_accounting_transaction_buttons": buttons}
+        ), patch.object(
+            restarted_bridge, "_materialize_media", return_value=str(self.slip)
+        ), patch.object(
+            restarted_bridge, "call_akson_ocr"
+        ) as restarted_ocr, patch.object(
+            restarted_bridge, "call_akson_party_note_extraction"
+        ) as restarted_fallback, patch.object(
+            restarted_bridge.os, "makedirs"
+        ), patch(
+            "builtins.open", mock_open()
+        ):
+            resumed_result = restarted_context.hooks["pre_gateway_dispatch"](event)
+
+        self.assertEqual(resumed_result, {"action": "skip"})
+        restarted_ocr.assert_not_called()
+        restarted_fallback.assert_not_called()
+        self.assertEqual(resumed_handoffs[0]["parsed"], persisted["parsed"])
+        durable = self.store.get_by_reference(
+            "phase-d-party-note-resume-tenant", "PARTY-NOTE-RESUME"
+        )
+        self.assertEqual(durable["ocr_fields"]["payer"], persisted["parsed"]["payer"])
+        self.assertEqual(durable["ocr_fields"]["payee"], persisted["parsed"]["payee"])
+        self.assertEqual(durable["ocr_fields"]["note"], persisted["parsed"]["note"])
+
     def test_existing_handoff_is_idempotent_and_does_not_enrich_ocr_fields(self):
         tenant_id = "phase-d-idempotent-tenant"
         handoff = {
@@ -636,6 +815,7 @@ class PhaseDOcrHandoffRegressionTests(unittest.TestCase):
             lookup_ocr_ingress=lambda *args: None,
             obtain_ocr_ingress=obtain,
             find_ocr_duplicate_candidates=lambda outcome: [],
+            persist_ocr_ingress_result=lambda outcome: outcome,
             complete_ocr_ingress=lambda outcome, transaction_id: None,
             handoff_ocr_result=lambda *args, **kwargs: handed_off.append(
                 kwargs["ocr_result"]
