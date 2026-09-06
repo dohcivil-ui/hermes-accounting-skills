@@ -2,6 +2,7 @@ import importlib.util
 import os
 import sys
 from datetime import datetime, timezone
+from decimal import Decimal
 from pathlib import Path
 import unittest
 from unittest import mock
@@ -158,6 +159,50 @@ class PeriodAndAggregationTests(unittest.TestCase):
         self.assertEqual(report.count, 2)
         self.assertEqual((report.income, report.expense, report.net), (100, 363, -263))
 
+    def test_amount_accepts_existing_numeric_types_and_numeric_text(self):
+        for value, expected in (
+            (363, Decimal("363")),
+            (363.0, Decimal("363.0")),
+            (Decimal("363.00"), Decimal("363.00")),
+            ("363.00", Decimal("363.00")),
+            ("363", Decimal("363")),
+            ("0", Decimal("0")),
+            ("0.00", Decimal("0.00")),
+            (" 363.00 ", Decimal("363.00")),
+        ):
+            with self.subTest(value=value):
+                self.assertEqual(self.reporting._amount(value), expected)
+
+    def test_amount_rejects_empty_boolean_negative_non_finite_and_malformed_values(self):
+        for value in (
+            None,
+            "",
+            "   ",
+            True,
+            False,
+            -1,
+            Decimal("-0.01"),
+            "3_63.00",
+            "1__0",
+            "1,000.00",
+            "1e3",
+            "+363",
+            "-1",
+            ".50",
+            "1.",
+            "1.2.3",
+            float("nan"),
+            float("inf"),
+            float("-inf"),
+            "NaN",
+            "Infinity",
+            "not-a-number",
+        ):
+            with self.subTest(value=value), self.assertRaises(
+                self.reporting.MalformedSheetRowError
+            ):
+                self.reporting._amount(value)
+
     def test_report_money_always_has_grouping_and_two_decimal_places(self):
         period = self.reporting.current_month_period(
             datetime(2026, 9, 4, 20, 30, tzinfo=timezone.utc)
@@ -220,7 +265,7 @@ class PeriodAndAggregationTests(unittest.TestCase):
         projects = [{"project_id": "p1", "project_name": "บ้านตัวอย่าง"}]
         base = {"date": "2026-09-03", "project_id": "p1", "project": "บ้านตัวอย่าง", "type": "income", "category": "", "amount": 100, "payee": "ผู้จ่าย", "status": "confirmed"}
         for field, value in (
-            ("amount", "100"),
+            ("amount", "not-a-number"),
             ("type", "other"),
             ("status", None),
             ("status", ""),

@@ -126,9 +126,26 @@ class ReportingSheetsReaderTests(unittest.TestCase):
             reader.read()
         self.assertEqual(len(session.calls), 1)
 
+    def test_numeric_text_amount_from_sheet_reaches_report_delivery(self):
+        session = ReadOnlySheetsSession(reporting)
+        session.transactions[1][9] = "363.00"
+        reader = reporting.ReportingSheetsReader("sheet-1", lambda: "token", session=session)
+        sender = FakeSender()
+        with tempfile.TemporaryDirectory() as directory:
+            runner = reporting.ReportRunner(
+                reader,
+                sender,
+                reporting.DeliveryLedger(Path(directory) / "ledger.sqlite3"),
+                FakeArtifacts(directory),
+                destination="telegram:synthetic-chat",
+            )
+            runner.run("daily", datetime(2026, 9, 3, 14, 0, tzinfo=timezone.utc))
+        self.assertEqual(len(sender.sent), 1)
+        self.assertIn("363.00", sender.sent[0][2])
+
     def test_malformed_confirmed_sheet_row_fails_before_delivery(self):
         session = ReadOnlySheetsSession(reporting)
-        session.transactions[1][9] = "500"
+        session.transactions[1][9] = "not-a-number"
         reader = reporting.ReportingSheetsReader("sheet-1", lambda: "token", session=session)
         sender = FakeSender()
         with tempfile.TemporaryDirectory() as directory:
