@@ -10,11 +10,12 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from html import escape
 import hashlib
 import os
 from pathlib import Path
+import re
 import sqlite3
 import sys
 import tempfile
@@ -252,9 +253,17 @@ def _project_key(row):
 
 
 def _amount(value):
-    if isinstance(value, bool) or not isinstance(value, (int, float, Decimal)):
+    if isinstance(value, bool) or not isinstance(value, (int, float, Decimal, str)):
         raise MalformedSheetRowError("Confirmed transaction amount must be numeric")
-    amount = Decimal(str(value))
+    text = str(value).strip()
+    if isinstance(value, str) and not re.fullmatch(r"[0-9]+(?:\.[0-9]+)?", text):
+        raise MalformedSheetRowError("Confirmed transaction amount must be numeric")
+    try:
+        amount = Decimal(text)
+    except (InvalidOperation, ValueError) as exc:
+        raise MalformedSheetRowError(
+            "Confirmed transaction amount must be numeric"
+        ) from exc
     if not amount.is_finite() or amount < 0:
         raise MalformedSheetRowError("Confirmed transaction amount must be finite and non-negative")
     return amount
