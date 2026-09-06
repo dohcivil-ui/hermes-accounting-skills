@@ -248,9 +248,7 @@ class TelegramTransactionWiringTests(unittest.TestCase):
         self.assertEqual(self.pipeline.calls, 0)
 
         invalid = self.controller.handle_manual_message("not-a-number", **self.actor)
-        self.assertEqual(invalid["error_code"], "validation_error")
-        self.assertIsNotNone(invalid["prompt"])
-        self.assertNotIn(invalid["error_code"], {"DRIVE_TRANSIENT", "SHEETS_TRANSIENT"})
+        self.assertIsNone(invalid)
         self.assertEqual(self.pipeline.calls, 0)
 
         valid = self.controller.handle_manual_message("250.75", **self.actor)
@@ -281,7 +279,7 @@ class TelegramTransactionWiringTests(unittest.TestCase):
         self.assertEqual(self.pipeline.calls, 0)
 
         invalid = self.controller.handle_manual_message("01/09/2026", **self.actor)
-        self.assertEqual(invalid["error_code"], "validation_error")
+        self.assertIsNone(invalid)
         self.assertEqual(self.pipeline.calls, 0)
 
         valid = self.controller.handle_manual_message("2026-09-01", **self.actor)
@@ -1780,6 +1778,92 @@ class TelegramTransactionWiringTests(unittest.TestCase):
                 plugin._patch_module(fake_name, strict=True)
         finally:
             sys.modules.pop(fake_name, None)
+
+
+    def test_conversational_routing_amount_valid_passes(self):
+        # 1. amount 363.00 ผ่าน
+        record = self.flow.begin(
+            tenant_id="tenant-test", platform="telegram", chat_id="1001",
+            thread_id=None, session_id="conv-amount-valid", telegram_user_id="2002",
+            source_image_path=self.slip,
+            ocr_result={"parsed": {
+                "reference_no": "CONV-AMOUNT-VALID",
+                "amount": None,
+                "date": "2026-08-30",
+            }},
+        )
+        result = self.controller.handle_manual_message("363.00", **self.actor)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["prompt"]["current_state"], "waiting_project")
+
+        # Verify transaction state and version updated
+        durable = self.flow.get_transaction(record["transaction_id"], **self.actor)
+        self.assertEqual(durable["ocr_fields"]["amount"], 363.00)
+        self.assertFalse(durable["needs_amount"])
+
+    def test_conversational_routing_date_valid_passes(self):
+        # 2. date 2026-09-06 ผ่าน
+        record = self.flow.begin(
+            tenant_id="tenant-test", platform="telegram", chat_id="1001",
+            thread_id=None, session_id="conv-date-valid", telegram_user_id="2002",
+            source_image_path=self.slip,
+            ocr_result={"parsed": {
+                "reference_no": "CONV-DATE-VALID",
+                "amount": 363,
+                "date": None,
+            }},
+        )
+        result = self.controller.handle_manual_message("2026-09-06", **self.actor)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["prompt"]["current_state"], "waiting_project")
+
+        # Verify transaction state and version updated
+        durable = self.flow.get_transaction(record["transaction_id"], **self.actor)
+        self.assertEqual(durable["ocr_fields"]["date"], "2026-09-06")
+
+    def test_conversational_routing_amount_invalid_fallback(self):
+        # 3. amount + "ยอดวันนี้" → None และ state/version ไม่เปลี่ยน
+        record = self.flow.begin(
+            tenant_id="tenant-test", platform="telegram", chat_id="1001",
+            thread_id=None, session_id="conv-amount-invalid", telegram_user_id="2002",
+            source_image_path=self.slip,
+            ocr_result={"parsed": {
+                "reference_no": "CONV-AMOUNT-INVALID",
+                "amount": None,
+                "date": "2026-08-30",
+            }},
+        )
+        before = self.flow.get_transaction(record["transaction_id"], **self.actor)
+
+        result = self.controller.handle_manual_message("ยอดวันนี้", **self.actor)
+        self.assertIsNone(result)
+
+        after = self.flow.get_transaction(record["transaction_id"], **self.actor)
+        self.assertEqual(before["version"], after["version"])
+        self.assertEqual(before["current_state"], after["current_state"])
+        self.assertNotIn("amount", after["ocr_fields"])
+
+    def test_conversational_routing_date_invalid_fallback(self):
+        # 4. date + "สรุปยอด" → None และ state/version ไม่เปลี่ยน
+        record = self.flow.begin(
+            tenant_id="tenant-test", platform="telegram", chat_id="1001",
+            thread_id=None, session_id="conv-date-invalid", telegram_user_id="2002",
+            source_image_path=self.slip,
+            ocr_result={"parsed": {
+                "reference_no": "CONV-DATE-INVALID",
+                "amount": 363,
+                "date": None,
+            }},
+        )
+        before = self.flow.get_transaction(record["transaction_id"], **self.actor)
+
+        result = self.controller.handle_manual_message("สรุปยอด", **self.actor)
+        self.assertIsNone(result)
+
+        after = self.flow.get_transaction(record["transaction_id"], **self.actor)
+        self.assertEqual(before["version"], after["version"])
+        self.assertEqual(before["current_state"], after["current_state"])
+        self.assertNotIn("date", after["ocr_fields"])
 
 
 if __name__ == "__main__":
