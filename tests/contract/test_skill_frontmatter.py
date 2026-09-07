@@ -10,7 +10,7 @@ SKILLS_ROOT = ROOT / "skills/accounting"
 class SkillFrontmatterTests(unittest.TestCase):
     def test_every_skill_has_named_frontmatter(self):
         skill_files = sorted(SKILLS_ROOT.glob("*/SKILL.md"))
-        self.assertEqual(len(skill_files), 7)
+        self.assertEqual(len(skill_files), 8)
 
         failures = []
         for skill_file in skill_files:
