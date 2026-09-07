@@ -304,17 +304,12 @@ class TelegramTransactionController:
         if record is None:
             return None
         if record.get("entry_mode") in {"amount", "date"}:
-            staged = self._flow.stage_pending_manual_input(text, **actor)
-            if not staged:
+            try:
+                self._flow.validate_manual_input(
+                    text, input_mode=record["entry_mode"]
+                )
+            except ValueError:
                 return None
-            pending = self._flow.get_pending_manual_input(**actor)
-            return self.handle_manual_input(
-                record["transaction_id"],
-                record["version"],
-                text,
-                pending_manual_input=pending,
-                **actor,
-            )
         return self.handle_manual_input(
             record["transaction_id"],
             record["version"],
