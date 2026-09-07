@@ -572,6 +572,32 @@ class TelegramTransactionWiringTests(unittest.TestCase):
         self.assertNotIn("amount", durable["ocr_fields"])
         self.assertIsNone(self.flow.get_pending_manual_input(**self.actor))
 
+    def test_manual_failure_reports_sanitized_diagnostic_stage_and_reason(self):
+        pending = self.begin_manual_pending(
+            "DIAGNOSTIC-DATE", 0, "date"
+        )
+        with patch.object(
+            self.flow,
+            "submit_manual",
+            side_effect=self.flow_module.InvalidTransitionError(
+                "Manual input is not expected"
+            ),
+        ):
+            result = self.controller.handle_manual_message(
+                "2026-09-06", **self.actor
+            )
+
+        self.assertEqual(result["error_code"], "invalid_transition")
+        self.assertEqual(result["diagnostic_stage"], "submit_manual")
+        self.assertEqual(
+            result["diagnostic_reason"], "manual_input_not_expected"
+        )
+        self.assertEqual(result["prompt"]["text"], "รายการนี้ไม่รอรับข้อมูลแล้ว")
+        durable = self.flow.get_transaction(
+            pending["transaction_id"], **self.actor
+        )
+        self.assertEqual(durable["entry_mode"], "date")
+
     def test_cancel_clears_pending_typed_value(self):
         records = self.begin_manual_pending_pair("PENDING-CANCEL", "date")
         target = records[1]
@@ -1219,6 +1245,33 @@ class TelegramTransactionWiringTests(unittest.TestCase):
             self.assertNotIn("1001", success_logs)
             self.assertNotIn("2002", success_logs)
 
+            with patch.dict(
+                os.environ, {"LEKZA_RUNTIME_ENV": "production"}
+            ), patch.object(
+                self.controller,
+                "handle_manual_message",
+                return_value={
+                    "ok": False,
+                    "error_code": "invalid_transition",
+                    "diagnostic_stage": "submit_manual",
+                    "diagnostic_reason": "manual_input_not_expected",
+                    "prompt": {"text": "diagnostic", "buttons": []},
+                },
+            ), self.assertLogs(
+                "lekza.accounting_transaction_buttons", level="INFO"
+            ) as diagnostic:
+                asyncio.run(adapter._handle_text_message(update, None))
+
+            diagnostic_logs = "\n".join(diagnostic.output)
+            self.assertIn("error_code=invalid_transition", diagnostic_logs)
+            self.assertIn("diagnostic_stage=submit_manual", diagnostic_logs)
+            self.assertIn(
+                "diagnostic_reason=manual_input_not_expected", diagnostic_logs
+            )
+            self.assertNotIn(Message.text, diagnostic_logs)
+            self.assertNotIn("1001", diagnostic_logs)
+            self.assertNotIn("2002", diagnostic_logs)
+
             sensitive_exception = "token=synthetic-secret raw customer text"
             with patch.dict(
                 os.environ, {"LEKZA_RUNTIME_ENV": "production"}
@@ -1258,7 +1311,7 @@ class TelegramTransactionWiringTests(unittest.TestCase):
         self.assertEqual(original_calls, ["text"])
         self.assertEqual(durable["reference_no"], "MANUAL-REFERENCE-001")
         self.assertFalse(durable["needs_reference"])
-        self.assertEqual(len(replies), 2)
+        self.assertEqual(len(replies), 3)
         self.assertEqual(replies[-1][0], "กรุณากรอกยอดใหม่")
 
     def test_runtime_patch_rebinds_already_registered_text_handler(self):

@@ -265,6 +265,7 @@ class TelegramTransactionController:
         pending_manual_input=None,
     ):
         actor = self._actor(platform, chat_id, telegram_user_id)
+        diagnostic_stage = "submit_manual"
         try:
             updated = self._flow.submit_manual(
                 transaction_id,
@@ -273,15 +274,20 @@ class TelegramTransactionController:
                 pending_manual_input=pending_manual_input,
                 **actor,
             )
+            diagnostic_stage = "clear_manual_selection"
             self._flow.clear_manual_selection(transaction_id, **actor)
             if updated["current_state"] in {
                 "confirmed_intent", "drive_pending", "drive_uploaded",
                 "sheets_pending",
             }:
+                diagnostic_stage = "run_save"
                 return self._run_save(transaction_id, actor)
+            diagnostic_stage = "render_success"
             return self._success(transaction_id, actor)
         except Exception as exc:
             result = self._flow_error(exc)
+            result["diagnostic_stage"] = diagnostic_stage
+            result["diagnostic_reason"] = self._manual_diagnostic_reason(exc)
             result["prompt"] = self._manual_error_prompt(result)
             return result
 
@@ -530,6 +536,28 @@ class TelegramTransactionController:
             "KeyError": "not_found",
         }
         return self._error(codes.get(name, "invalid_callback"))
+
+    @staticmethod
+    def _manual_diagnostic_reason(exc):
+        if exc.__class__.__name__ != "InvalidTransitionError":
+            reasons = {
+                "AuthorizationError": "unauthorized",
+                "StaleStateError": "stale_state",
+                "ValueError": "validation_error",
+                "KeyError": "not_found",
+            }
+            return reasons.get(exc.__class__.__name__, "unclassified_error")
+        message = str(exc)
+        reasons = {
+            "Selected transaction does not match manual input mode":
+                "manual_mode_mismatch",
+            "Transition contains immutable fields": "immutable_transition",
+            "Unknown transaction state": "unknown_state",
+            "Manual input is not expected": "manual_input_not_expected",
+        }
+        if message.startswith("Transition is invalid from "):
+            return "transition_state_mismatch"
+        return reasons.get(message, "invalid_transition_unclassified")
 
     @staticmethod
     def _actor(platform, chat_id, telegram_user_id):

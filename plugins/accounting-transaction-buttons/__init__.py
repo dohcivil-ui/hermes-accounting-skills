@@ -389,10 +389,14 @@ def _patch_module(mod_name, *, strict=False):
                     telegram_user_id=user_id,
                 )
                 _LOG.info(
-                    "Lekza manual result present=%s ok=%s prompt_present=%s",
+                    "Lekza manual result present=%s ok=%s prompt_present=%s "
+                    "error_code=%s diagnostic_stage=%s diagnostic_reason=%s",
                     result is not None,
                     bool(result and result.get("ok")),
                     bool(result and result.get("prompt")),
+                    result.get("error_code") if result else None,
+                    result.get("diagnostic_stage") if result else None,
+                    result.get("diagnostic_reason") if result else None,
                 )
                 if result is not None:
                     response = result.get("prompt") or {
