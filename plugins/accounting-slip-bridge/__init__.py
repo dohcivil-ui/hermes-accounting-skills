@@ -1075,15 +1075,16 @@ def register(ctx):
 - raw_ocr_text: {raw_text}
 - parsed fields: {json.dumps(parsed_fields, ensure_ascii=False)}
 - usage: {json.dumps(usage, ensure_ascii=False)}
-- status: waiting_for_confirm
+- status: handoff_failed
 - transaction_id: {transaction_id or "unavailable"}
 - telegram_buttons: {"scheduled" if transaction_id else "unavailable"}
 
 คำสั่งระบบสำหรับ Agent:
 1. ห้ามใช้ Vision อ่านสลิปซ้ำ ให้สรุปรายการจากผล AksonOCR ด้านบนเท่านั้น
-2. แสดงรายละเอียดรายการและยอดเงินให้ผู้ใช้ตรวจสอบ
-3. ต้องถามผู้ใช้ให้กด Confirm หรือยืนยันก่อนดำเนินการใดๆ
-4. ห้ามเขียนหรือบันทึกข้อมูลลง Google Drive หรือ Google Sheets จนกว่าจะได้รับการยืนยัน (Confirm) จากผู้ใช้ที่ถูกต้อง
+2. แจ้งว่าส่งต่อเข้า durable transaction flow ไม่สำเร็จ และยังยืนยันสถานะบันทึกไม่ได้ ต้องตรวจรายการเดิมก่อนดำเนินการต่อ
+3. ห้ามเปิด wizard เรียก clarify ขอ Confirm หรือถือว่าข้อความยืนยันเป็นสิทธิ์บันทึกแทน durable callback
+4. ห้ามเขียน Google Drive / Google Sheets สร้าง master data หรือแก้ pending state เอง
+5. ห้ามสั่งส่งสลิปซ้ำหรือเรียก OCR ซ้ำ และห้ามอ้างว่ารายการยังไม่ถูกสร้าง
 """
                 return {
                     "action": "rewrite",

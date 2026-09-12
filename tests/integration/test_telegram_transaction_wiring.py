@@ -2066,6 +2066,27 @@ class TelegramTransactionWiringTests(unittest.TestCase):
         self.assertEqual(before, after)
         self.assertIsNone(self.flow.get_pending_manual_input(**self.actor))
 
+    def test_natural_accounting_question_delegates_without_transaction_mutation(self):
+        record = self.flow.begin(
+            tenant_id="tenant-test", platform="telegram", chat_id="1001",
+            thread_id=None, session_id="conv-natural-query", telegram_user_id="2002",
+            source_image_path=self.slip,
+            ocr_result={"parsed": {
+                "reference_no": "CONV-NATURAL-QUERY",
+                "amount": None,
+                "date": "2026-09-07",
+            }},
+        )
+        before = self.flow.get_transaction(record["transaction_id"], **self.actor)
+
+        result = self.controller.handle_manual_message(
+            "วันนี้จ่ายเท่าไหร่", **self.actor
+        )
+
+        self.assertIsNone(result)
+        after = self.flow.get_transaction(record["transaction_id"], **self.actor)
+        self.assertEqual(before, after)
+
 
 if __name__ == "__main__":
     unittest.main()
