@@ -166,6 +166,156 @@ class ConversationalAccountingAgentTests(unittest.TestCase):
         self.assertEqual(result["result"], {"total": 3, "active": 2})
         self.assertTrue(result["read_only"])
 
+    def test_totals_apply_party_filter_to_amounts_counts_and_projects(self):
+        result = self.engine.query(
+            {"intent": "totals", "metric": "expense", "party": "ร้านเหล็ก",
+             "party_role": "payee"}, now=self.now,
+        )
+
+        self.assertEqual(result["result"]["value"], "1700.25")
+        self.assertEqual(result["result"]["income"], "0.00")
+        self.assertEqual(result["result"]["net"], "-1700.25")
+        self.assertEqual(result["result"]["transaction_count"], 2)
+        self.assertEqual(result["grounding"]["matched_transaction_count"], 2)
+        projects = {row["project_id"]: row for row in result["result"]["projects"]}
+        self.assertEqual(projects["P-AIRPORT"]["expense"], "1000.25")
+        self.assertEqual(projects["P-HOUSE"]["expense"], "700.00")
+        self.assertEqual(projects["P-CLOSED"]["transaction_count"], 0)
+
+    def test_party_summary_respects_each_metric(self):
+        self.transactions.append(self.transaction(
+            "T-PARTY-IN", "P-AIRPORT", "งานสนามบิน", "income", "300.00",
+            payee="ร้านเหล็ก", payer="ลูกค้า B", category="installment",
+        ))
+        for metric, amount, count in (
+            ("expense", "1700.25", 2), ("income", "300.00", 1),
+            ("net", "-1400.25", 3), ("all", "2000.25", 3),
+        ):
+            with self.subTest(metric=metric):
+                result = self.engine.query(
+                    {"intent": "party_summary", "party": "ร้านเหล็ก",
+                     "party_role": "payee", "metric": metric}, now=self.now,
+                )
+                self.assertEqual(result["result"]["summaries"], [{
+                    "role": "payee", "name": "ร้านเหล็ก", "amount": amount,
+                    "transaction_count": count,
+                }])
+
+    def test_explain_preserves_party_filter_from_previous_context(self):
+        first = self.engine.query(
+            {"intent": "party_summary", "party": "ร้านเหล็ก",
+             "party_role": "payee", "metric": "expense"}, now=self.now,
+        )
+        result = self.engine.query(
+            {"intent": "explain", "previous_context": first["context"]},
+            now=self.now,
+        )
+
+        self.assertEqual(result["result"]["by_payee"], [{
+            "name": "ร้านเหล็ก", "amount": "1700.25", "transaction_count": 2,
+        }])
+        self.assertEqual(
+            {row["transaction_id"] for row in result["result"]["largest_transactions"]},
+            {"T-1", "T-3"},
+        )
+        self.assertEqual(result["grounding"]["matched_transaction_count"], 2)
+
+    def test_party_totals_support_payer_and_count_both_roles_once(self):
+        self.transactions[:] = [self.transaction(
+            "T-SELF", "P-AIRPORT", "งานสนามบิน", "expense", "100.00",
+            payee="คนเดียวกัน", payer="คนเดียวกัน", category="materials",
+        )]
+        for role in ("payer", "payee", "both"):
+            with self.subTest(role=role):
+                result = self.engine.query(
+                    {"intent": "totals", "metric": "expense",
+                     "party": "คนเดียวกัน", "party_role": role}, now=self.now,
+                )
+                self.assertEqual(result["result"]["value"], "100.00")
+                self.assertEqual(result["result"]["transaction_count"], 1)
+
+    def test_unknown_or_ambiguous_party_fails_for_totals_and_explain(self):
+        self.transactions.append(self.transaction(
+            "T-OTHER-SHOP", "P-AIRPORT", "งานสนามบิน", "expense", "10.00",
+            payee="ร้านไม้", payer="Lekza", category="materials",
+        ))
+        for intent in ("totals", "explain"):
+            for party, message in (("ไม่มีชื่อนี้", "Unknown"), ("ร้าน", "Ambiguous")):
+                with self.subTest(intent=intent, party=party):
+                    with self.assertRaisesRegex(self.module.AccountingQueryError, message):
+                        self.engine.query(
+                            {"intent": intent, "party": party, "party_role": "payee",
+                             "previous_context": {"intent": "totals"}}, now=self.now,
+                        )
+
+    def test_project_id_precedes_conflicting_name_for_totals_and_explain(self):
+        self.transactions.append(self.transaction(
+            "T-CONFLICT", "P-HOUSE", "งานสนามบิน", "expense", "300.00",
+            payee="ร้านเหล็ก", payer="Lekza", category="materials",
+        ))
+        for project, amount, count, ids in (
+            ("P-AIRPORT", "1500.00", 3, {"T-1", "T-2"}),
+            ("P-HOUSE", "1000.00", 2, {"T-3", "T-CONFLICT"}),
+        ):
+            with self.subTest(project=project):
+                totals = self.engine.query(
+                    {"intent": "totals", "project": project, "metric": "expense"},
+                    now=self.now,
+                )
+                explanation = self.engine.query(
+                    {"intent": "explain", "previous_context": totals["context"]},
+                    now=self.now,
+                )
+                self.assertEqual(totals["result"]["value"], amount)
+                self.assertEqual(totals["grounding"]["matched_transaction_count"], count)
+                self.assertEqual(
+                    {row["transaction_id"] for row in explanation["result"]["largest_transactions"]},
+                    ids,
+                )
+                if project == "P-HOUSE":
+                    self.assertTrue(all(
+                        row["project"] == "บ้านคุณสมชาย"
+                        for row in explanation["result"]["largest_transactions"]
+                    ))
+
+    def test_project_name_fallback_matches_existing_aggregator(self):
+        for project_id in ("", "P-UNKNOWN"):
+            with self.subTest(project_id=project_id):
+                self.transactions[:] = [self.transaction(
+                    "T-FALLBACK", project_id, "งานสนามบิน", "expense", "50.00",
+                    payee="ร้านเหล็ก", payer="Lekza", category="materials",
+                )]
+                result = self.engine.query(
+                    {"intent": "totals", "project": "P-AIRPORT", "metric": "expense"},
+                    now=self.now,
+                )
+                self.assertEqual(result["result"]["value"], "50.00")
+                self.assertEqual(result["grounding"]["matched_transaction_count"], 1)
+
+    def test_project_count_does_not_parse_transaction_values(self):
+        for field, value in (("amount", "bad"), ("date", "not-a-date"), ("status", "unknown")):
+            with self.subTest(field=field):
+                original = self.transactions[0][field]
+                self.transactions[0][field] = value
+                try:
+                    result = self.engine.query({"intent": "project_count"}, now=self.now)
+                    self.assertEqual(result["result"], {"total": 3, "active": 2})
+                    self.assertEqual(result["grounding"]["source"], "Projects")
+                    self.assertNotIn("matched_transaction_count", result["grounding"])
+                    self.assertNotIn("status", result["grounding"])
+                finally:
+                    self.transactions[0][field] = original
+
+    def test_project_count_still_rejects_invalid_project_master(self):
+        for invalid in (dict(self.projects[0]), {"project_id": "P-BAD", "project_name": ""}):
+            with self.subTest(invalid=invalid):
+                self.projects.append(invalid)
+                try:
+                    with self.assertRaises(self.module._reporting_module().MalformedSheetRowError):
+                        self.engine.query({"intent": "project_count"}, now=self.now)
+                finally:
+                    self.projects.pop()
+
 
 if __name__ == "__main__":
     unittest.main()

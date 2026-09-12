@@ -117,8 +117,8 @@ def _resolve_project(project_rows, requested):
     exact = []
     partial = []
     for row in project_rows:
-        project_id = _text(row.get("project_id"))
-        project_name = _text(row.get("project_name"))
+        project_id = str(row.get("project_id") or "").strip()
+        project_name = str(row.get("project_name") or "").strip()
         if needle in {_key(project_id), _key(project_name)}:
             exact.append((project_id, project_name))
         elif needle in _key(project_name):
@@ -197,7 +197,9 @@ def _project_reports(report, selected):
     )
 
 
-def _filtered_rows(transaction_rows, period, selected, reporting):
+def _filtered_rows(transaction_rows, period, selected, reporting, projects):
+    by_id = {project.project_id: project for project in projects if project.project_id}
+    by_name = {project.project_name: project for project in projects}
     rows = []
     for row in transaction_rows:
         if _text(row.get("status")) != "confirmed":
@@ -205,14 +207,22 @@ def _filtered_rows(transaction_rows, period, selected, reporting):
         transaction_date = reporting._transaction_date(row.get("date"))
         if not period.start <= transaction_date <= period.end:
             continue
-        if selected is not None:
-            project_id = _text(row.get("project_id"))
-            project_name = _text(row.get("project"))
-            if not (
-                selected["project_id"] and project_id == selected["project_id"]
-            ) and project_name != selected["project_name"]:
-                continue
+        # Match aggregate_report: a known ID wins; otherwise fall back to name.
+        project_id = str(row.get("project_id") or "").strip()
+        project_name = str(row.get("project") or "").strip()
+        project = by_id.get(project_id) or by_name.get(project_name)
+        if project is None:
+            raise reporting.MalformedSheetRowError(
+                "Confirmed transaction references an unknown project"
+            )
+        if selected is not None and (
+            project.project_id != selected["project_id"]
+            or project.project_name != selected["project_name"]
+        ):
+            continue
         copied = dict(row)
+        copied["project_id"] = project.project_id
+        copied["project"] = project.project_name
         copied["_date"] = transaction_date
         copied["_amount"] = reporting._amount(row.get("amount"))
         rows.append(copied)
@@ -278,17 +288,21 @@ def _resolve_party(rows, requested, roles):
     raise AccountingQueryError(f"Ambiguous payer/payee: {', '.join(matches)}")
 
 
-def _party_summary(rows, requested, party_role):
+def _party_summary(rows, selected_party, party_role, metric):
     roles = ("payee", "payer") if party_role == "both" else (party_role,)
-    selected_party = _resolve_party(rows, requested, roles)
     totals = defaultdict(lambda: {"amount": Decimal("0"), "count": 0})
     for row in rows:
+        if metric in {"income", "expense"} and row["type"] != metric:
+            continue
+        amount = row["_amount"]
+        if metric == "net" and row["type"] == "expense":
+            amount = -amount
         for role in roles:
             name = _text(row.get(role))
             if not name or (selected_party and name != selected_party):
                 continue
             key = (role, name)
-            totals[key]["amount"] += row["_amount"]
+            totals[key]["amount"] += amount
             totals[key]["count"] += 1
     summaries = [
         {
@@ -378,27 +392,45 @@ class AccountingQueryEngine:
         now = datetime.now(timezone.utc) if now is None else now
         period = _period(effective["period"], now, self._reporting)
         project_rows, transaction_rows = self._reader.read()
+        count_projects = effective["intent"] == "project_count"
         report = self._reporting.aggregate_report(
-            "conversational", period, project_rows, transaction_rows
+            "conversational", period, project_rows,
+            () if count_projects else transaction_rows,
         )
         selected = _resolve_project(project_rows, effective["project"])
-        rows = _filtered_rows(transaction_rows, period, selected, self._reporting)
+        if count_projects:
+            return {
+                "ok": True,
+                "read_only": True,
+                "intent": "project_count",
+                "context": _context(effective, selected),
+                "result": {
+                    "total": len(report.projects),
+                    "active": sum(
+                        _key(row.get("status")) == "active" for row in project_rows
+                    ),
+                },
+                "grounding": {"reader": "ReportingSheetsReader", "source": "Projects"},
+            }
+        rows = _filtered_rows(
+            transaction_rows, period, selected, self._reporting, report.projects
+        )
+        roles = ("payee", "payer") if effective["party_role"] == "both" else (effective["party_role"],)
+        party = _resolve_party(rows, effective["party"], roles)
+        if party is not None:
+            rows = [row for row in rows if any(_text(row.get(role)) == party for role in roles)]
+            report = self._reporting.aggregate_report(
+                "conversational", period, project_rows, rows
+            )
+        effective["party"] = party
         context = _context(effective, selected)
 
         if effective["requested_intent"] == "explain":
             intent = "explain"
             result = _explanation(rows, effective["metric"])
-        elif effective["intent"] == "project_count":
-            intent = "project_count"
-            result = {
-                "total": len(project_rows),
-                "active": sum(
-                    _key(row.get("status")) == "active" for row in project_rows
-                ),
-            }
         elif effective["intent"] == "party_summary":
             intent = "party_summary"
-            result = _party_summary(rows, effective["party"], effective["party_role"])
+            result = _party_summary(rows, party, effective["party_role"], effective["metric"])
         else:
             intent = "totals"
             result = _totals(report, selected, effective["metric"])
