@@ -572,6 +572,32 @@ class TelegramTransactionWiringTests(unittest.TestCase):
         self.assertNotIn("amount", durable["ocr_fields"])
         self.assertIsNone(self.flow.get_pending_manual_input(**self.actor))
 
+    def test_manual_failure_reports_sanitized_diagnostic_stage_and_reason(self):
+        pending = self.begin_manual_pending(
+            "DIAGNOSTIC-DATE", 0, "date"
+        )
+        with patch.object(
+            self.flow,
+            "submit_manual",
+            side_effect=self.flow_module.InvalidTransitionError(
+                "Manual input is not expected"
+            ),
+        ):
+            result = self.controller.handle_manual_message(
+                "2026-09-06", **self.actor
+            )
+
+        self.assertEqual(result["error_code"], "invalid_transition")
+        self.assertEqual(result["diagnostic_stage"], "submit_manual")
+        self.assertEqual(
+            result["diagnostic_reason"], "manual_input_not_expected"
+        )
+        self.assertEqual(result["prompt"]["text"], "รายการนี้ไม่รอรับข้อมูลแล้ว")
+        durable = self.flow.get_transaction(
+            pending["transaction_id"], **self.actor
+        )
+        self.assertEqual(durable["entry_mode"], "date")
+
     def test_cancel_clears_pending_typed_value(self):
         records = self.begin_manual_pending_pair("PENDING-CANCEL", "date")
         target = records[1]
@@ -1219,6 +1245,33 @@ class TelegramTransactionWiringTests(unittest.TestCase):
             self.assertNotIn("1001", success_logs)
             self.assertNotIn("2002", success_logs)
 
+            with patch.dict(
+                os.environ, {"LEKZA_RUNTIME_ENV": "production"}
+            ), patch.object(
+                self.controller,
+                "handle_manual_message",
+                return_value={
+                    "ok": False,
+                    "error_code": "invalid_transition",
+                    "diagnostic_stage": "submit_manual",
+                    "diagnostic_reason": "manual_input_not_expected",
+                    "prompt": {"text": "diagnostic", "buttons": []},
+                },
+            ), self.assertLogs(
+                "lekza.accounting_transaction_buttons", level="INFO"
+            ) as diagnostic:
+                asyncio.run(adapter._handle_text_message(update, None))
+
+            diagnostic_logs = "\n".join(diagnostic.output)
+            self.assertIn("error_code=invalid_transition", diagnostic_logs)
+            self.assertIn("diagnostic_stage=submit_manual", diagnostic_logs)
+            self.assertIn(
+                "diagnostic_reason=manual_input_not_expected", diagnostic_logs
+            )
+            self.assertNotIn(Message.text, diagnostic_logs)
+            self.assertNotIn("1001", diagnostic_logs)
+            self.assertNotIn("2002", diagnostic_logs)
+
             sensitive_exception = "token=synthetic-secret raw customer text"
             with patch.dict(
                 os.environ, {"LEKZA_RUNTIME_ENV": "production"}
@@ -1258,7 +1311,7 @@ class TelegramTransactionWiringTests(unittest.TestCase):
         self.assertEqual(original_calls, ["text"])
         self.assertEqual(durable["reference_no"], "MANUAL-REFERENCE-001")
         self.assertFalse(durable["needs_reference"])
-        self.assertEqual(len(replies), 2)
+        self.assertEqual(len(replies), 3)
         self.assertEqual(replies[-1][0], "กรุณากรอกยอดใหม่")
 
     def test_runtime_patch_rebinds_already_registered_text_handler(self):
@@ -1800,6 +1853,9 @@ class TelegramTransactionWiringTests(unittest.TestCase):
         durable = self.flow.get_transaction(record["transaction_id"], **self.actor)
         self.assertEqual(durable["ocr_fields"]["amount"], 363.00)
         self.assertFalse(durable["needs_amount"])
+        self.assertEqual(durable["version"], record["version"] + 1)
+        self.assertIsNone(durable["entry_mode"])
+        self.assertIsNone(self.flow.get_pending_manual_input(**self.actor))
 
     def test_conversational_routing_date_valid_passes(self):
         # 2. date 2026-09-06 ผ่าน
@@ -1820,6 +1876,147 @@ class TelegramTransactionWiringTests(unittest.TestCase):
         # Verify transaction state and version updated
         durable = self.flow.get_transaction(record["transaction_id"], **self.actor)
         self.assertEqual(durable["ocr_fields"]["date"], "2026-09-06")
+        self.assertEqual(durable["version"], record["version"] + 1)
+        self.assertIsNone(durable["entry_mode"])
+        self.assertIsNone(self.flow.get_pending_manual_input(**self.actor))
+
+    def assert_selected_mixed_mode_fallback(self, selected_mode, other_mode, text):
+        selected = self.begin_manual_pending("MIXED-SELECTED", 0, selected_mode)
+        self.begin_manual_pending("MIXED-OTHER", 1, other_mode)
+        self.flow.select_manual_pending(
+            selected["transaction_id"], expected_version=selected["version"],
+            **self.actor,
+        )
+        for existing_pending in (False, True):
+            if existing_pending:
+                self.store.set_pending_manual_input(text, other_mode, **self.actor)
+            for invalid_text in (text, "ยอดวันนี้", "not-a-value"):
+                with self.subTest(pending=existing_pending, text=invalid_text):
+                    before = list(self.store._connection.iterdump())
+                    with (
+                        patch.object(self.flow, "stage_pending_manual_input",
+                                     side_effect=AssertionError("Unexpected staging")),
+                        patch.object(self.flow, "get_pending_manual_input",
+                                     side_effect=AssertionError("Unexpected pending read")),
+                    ):
+                        result = self.controller.handle_manual_message(
+                            invalid_text, **self.actor
+                        )
+                    self.assertIsNone(result)
+                    self.assertEqual(list(self.store._connection.iterdump()), before)
+                    self.assertEqual(self.pipeline.calls, 0)
+
+    def test_resolved_input_ignores_pending_overwrite_after_validation(self):
+        for mode, text, other_mode, other_text in (
+            ("date", "2026-09-06", "amount", "363.00"),
+            ("amount", "363.00", "date", "2026-09-06"),
+        ):
+            with self.subTest(mode=mode):
+                selected = self.begin_manual_pending(f"RACE-{mode}", 0, mode)
+                peer = self.begin_manual_pending(f"RACE-{mode}", 1, other_mode)
+                self.flow.select_manual_pending(
+                    selected["transaction_id"],
+                    expected_version=selected["version"], **self.actor,
+                )
+                self.store.set_pending_manual_input(text, mode, **self.actor)
+                peer_before = self.store.get(peer["transaction_id"])
+                validator = self.flow.validate_manual_input
+                overwritten = []
+
+                def validate_then_overwrite(value, *, input_mode):
+                    validated = validator(value, input_mode=input_mode)
+                    writer = self.flow_module.SQLiteStateStore(self.db_path)
+                    try:
+                        writer.set_pending_manual_input(
+                            other_text, other_mode, **self.actor
+                        )
+                        overwritten.append(writer.get_pending_manual_input(**self.actor))
+                    finally:
+                        writer.close()
+                    return validated
+
+                with (
+                    patch.object(self.flow, "validate_manual_input",
+                                 side_effect=validate_then_overwrite) as validation,
+                    patch.object(self.flow, "stage_pending_manual_input",
+                                 side_effect=AssertionError("Unexpected staging")),
+                    patch.object(self.flow, "get_pending_manual_input",
+                                 side_effect=AssertionError("Unexpected pending read")),
+                    patch.object(self.flow, "submit_manual",
+                                 wraps=self.flow.submit_manual) as submit,
+                ):
+                    result = self.controller.handle_manual_message(text, **self.actor)
+                self.assertTrue(result["ok"])
+                validation.assert_called_once_with(text, input_mode=mode)
+                submit.assert_called_once_with(
+                    selected["transaction_id"], expected_version=selected["version"],
+                    value=text, pending_manual_input=None, **self.actor,
+                )
+                updated = self.store.get(selected["transaction_id"])
+                self.assertEqual(updated["version"], selected["version"] + 1)
+                self.assertIsNone(updated["entry_mode"])
+                self.assertEqual(updated["ocr_fields"][mode],
+                                 "2026-09-06" if mode == "date" else 363.00)
+                self.assertEqual(self.store.get(peer["transaction_id"]), peer_before)
+                self.assertEqual(self.store.get_pending_manual_input(**self.actor),
+                                 overwritten[0])
+                self.assertIsNone(self.store.get_manual_selection(**self.actor))
+
+    def test_selected_amount_with_date_peer_rejects_date_without_mutation(self):
+        self.assert_selected_mixed_mode_fallback("amount", "date", "2026-09-06")
+
+    def test_selected_date_with_amount_peer_rejects_amount_without_mutation(self):
+        self.assert_selected_mixed_mode_fallback("date", "amount", "363.00")
+
+    def test_selected_mixed_mode_matching_input_only_updates_selected(self):
+        records = {
+            mode: self.begin_manual_pending("MIXED-MATCH", index, mode)
+            for index, mode in enumerate(("amount", "date"))
+        }
+        for mode, text in (("amount", "363.00"), ("date", "2026-09-06")):
+            with self.subTest(mode=mode):
+                selected = records[mode]
+                other = records["date" if mode == "amount" else "amount"]
+                before_other = self.store.get(other["transaction_id"])
+                self.flow.select_manual_pending(
+                    selected["transaction_id"],
+                    expected_version=selected["version"], **self.actor,
+                )
+                result = self.controller.handle_manual_message(text, **self.actor)
+                self.assertTrue(result["ok"])
+                updated = self.store.get(selected["transaction_id"])
+                self.assertEqual(updated["version"], selected["version"] + 1)
+                self.assertIsNone(updated["entry_mode"])
+                self.assertEqual(self.store.get(other["transaction_id"]), before_other)
+                self.assertIsNone(self.store.get_manual_selection(**self.actor))
+                self.assertIsNone(self.flow.get_pending_manual_input(**self.actor))
+
+    def test_mixed_modes_without_selection_still_require_matching_selection(self):
+        records = {
+            mode: self.begin_manual_pending("MIXED-NO-SELECT", index, mode)
+            for index, mode in enumerate(("amount", "date"))
+        }
+        before = [self.store.get(r["transaction_id"]) for r in records.values()]
+        for mode, text in (("date", "2026-09-06"), ("amount", "363.00")):
+            with self.subTest(mode=mode):
+                result = self.controller.handle_manual_message(text, **self.actor)
+                self.assertEqual(result["error_code"], "manual_selection_required")
+                identities = [
+                    self.wiring.decode_callback(button["callback_data"])
+                    for button in result["prompt"]["buttons"]
+                ]
+                self.assertEqual(
+                    [identity.transaction_id for identity in identities],
+                    [records[mode]["transaction_id"]],
+                )
+                pending = self.flow.get_pending_manual_input(**self.actor)
+                self.assertEqual(pending["input_mode"], mode)
+                self.assertEqual(pending["typed_value"], text)
+                self.assertIsNone(self.store.get_manual_selection(**self.actor))
+                self.assertEqual(
+                    [self.store.get(r["transaction_id"]) for r in records.values()],
+                    before,
+                )
 
     def test_conversational_routing_amount_invalid_fallback(self):
         # 3. amount + "ยอดวันนี้" → None และ state/version ไม่เปลี่ยน
@@ -1842,6 +2039,8 @@ class TelegramTransactionWiringTests(unittest.TestCase):
         self.assertEqual(before["version"], after["version"])
         self.assertEqual(before["current_state"], after["current_state"])
         self.assertNotIn("amount", after["ocr_fields"])
+        self.assertEqual(before, after)
+        self.assertIsNone(self.flow.get_pending_manual_input(**self.actor))
 
     def test_conversational_routing_date_invalid_fallback(self):
         # 4. date + "สรุปยอด" → None และ state/version ไม่เปลี่ยน
@@ -1864,6 +2063,8 @@ class TelegramTransactionWiringTests(unittest.TestCase):
         self.assertEqual(before["version"], after["version"])
         self.assertEqual(before["current_state"], after["current_state"])
         self.assertNotIn("date", after["ocr_fields"])
+        self.assertEqual(before, after)
+        self.assertIsNone(self.flow.get_pending_manual_input(**self.actor))
 
     def test_natural_accounting_question_delegates_without_transaction_mutation(self):
         record = self.flow.begin(

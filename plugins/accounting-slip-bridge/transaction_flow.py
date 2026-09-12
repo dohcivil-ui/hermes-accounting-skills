@@ -1279,6 +1279,15 @@ class TransactionFlow:
             raise MultipleManualPendingError(records)
         return records[0] if records else None
 
+    @staticmethod
+    def validate_manual_input(value, *, input_mode):
+        manual_value = str(value or "").strip()
+        if input_mode == "amount":
+            return _as_number(manual_value)
+        if input_mode == "date":
+            return _normalized_transaction_date(manual_value)
+        raise ValueError("Unsupported manual input mode")
+
     def stage_pending_manual_input(
         self, value, *, platform, chat_id, telegram_user_id
     ):
