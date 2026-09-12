@@ -124,11 +124,113 @@ class ConversationalAccountingAgentTests(unittest.TestCase):
         self.assertEqual(follow_up["result"]["value"], "1500.00")
         self.assertEqual(follow_up["context"]["period"], "today")
         self.assertEqual(follow_up["context"]["metric"], "expense")
-        self.assertEqual(follow_up["context"]["project"], "งานสนามบิน")
+        self.assertEqual(follow_up["context"]["project"], "P-AIRPORT")
         self.assertEqual(
             explanation["result"]["by_category"][0],
             {"name": "materials", "amount": "1000.25", "transaction_count": 1},
         )
+
+    def test_follow_up_keeps_exact_project_id_when_names_or_ids_overlap(self):
+        for other_id, other_name in (
+            ("P-B", "SYNTHETIC JOB"),
+            ("P-B", "P-A"),
+            ("p-a", "Other Job"),
+        ):
+            with self.subTest(other_id=other_id, other_name=other_name):
+                projects = [
+                    {"project_id": "P-A", "project_name": "Synthetic Job"},
+                    {"project_id": other_id, "project_name": other_name},
+                ]
+                rows = [
+                    self.transaction(
+                        "T-SELECTED", "P-A", "Synthetic Job", "expense", "50.00",
+                        payer="Company", payee="Vendor", category="materials",
+                    ),
+                    self.transaction(
+                        "T-OTHER", other_id, other_name, "expense", "400.00",
+                        payer="Company", payee="Vendor", category="materials",
+                    ),
+                ]
+                engine = self.module.AccountingQueryEngine(FakeReader(projects, rows))
+                first = engine.query(
+                    {"intent": "totals", "project": "P-A", "metric": "expense"},
+                    now=self.now,
+                )
+                follow_up = engine.query(
+                    {"intent": "follow_up", "previous_context": first["context"]},
+                    now=self.now,
+                )
+                explanation = engine.query(
+                    {"intent": "explain", "previous_context": follow_up["context"]},
+                    now=self.now,
+                )
+                self.assertEqual(first["result"]["value"], "50.00")
+                self.assertEqual(follow_up["result"]["value"], "50.00")
+                self.assertEqual(follow_up["context"]["project"], "P-A")
+                self.assertEqual(
+                    [row["transaction_id"] for row in explanation["result"]["largest_transactions"]],
+                    ["T-SELECTED"],
+                )
+
+    def test_follow_up_survives_rename_and_allows_project_switch_or_clear(self):
+        first = self.engine.query(
+            {"intent": "totals", "project": "P-AIRPORT", "metric": "expense"},
+            now=self.now,
+        )
+        self.projects[0]["project_name"] = "Renamed Airport"
+        renamed = self.engine.query(
+            {"intent": "follow_up", "previous_context": first["context"]},
+            now=self.now,
+        )
+        self.assertEqual(renamed["result"]["value"], "1500.00")
+        self.assertEqual(renamed["result"]["projects"][0]["project_name"], "Renamed Airport")
+        switched = self.engine.query(
+            {"intent": "follow_up", "project": "P-HOUSE",
+             "previous_context": renamed["context"]}, now=self.now,
+        )
+        self.assertEqual(switched["result"]["value"], "700.00")
+        cleared = self.engine.query(
+            {"intent": "follow_up", "project": None,
+             "previous_context": switched["context"]}, now=self.now,
+        )
+        self.assertEqual(cleared["result"]["value"], "2200.00")
+        self.assertIsNone(cleared["context"]["project"])
+
+    def test_legacy_name_context_and_projects_without_ids_remain_supported(self):
+        for project_id in ("P-LEGACY", ""):
+            with self.subTest(project_id=project_id):
+                reader = FakeReader(
+                    [{"project_id": project_id, "project_name": "Legacy Job"}],
+                    [self.transaction(
+                        "T-LEGACY", project_id, "Legacy Job", "expense", "75.00",
+                        payer="Company", payee="Vendor", category="materials",
+                    )],
+                )
+                engine = self.module.AccountingQueryEngine(reader)
+                result = engine.query(
+                    {"intent": "follow_up", "previous_context": {
+                        "intent": "totals", "project": "Legacy Job",
+                        "period": "today", "metric": "expense",
+                    }}, now=self.now,
+                )
+                self.assertEqual(result["result"]["value"], "75.00")
+                self.assertEqual(result["context"]["project"], project_id or "Legacy Job")
+
+    def test_totals_count_includes_both_types_for_every_metric(self):
+        for metric, value in (
+            ("expense", "1500.00"), ("income", "5000.00"),
+            ("net", "3500.00"), ("all", None),
+        ):
+            with self.subTest(metric=metric):
+                result = self.engine.query(
+                    {"intent": "totals", "project": "P-AIRPORT", "metric": metric},
+                    now=self.now,
+                )
+                self.assertEqual(result["result"]["value"], value)
+                # Two expenses plus one income; metric selects value, not count.
+                self.assertEqual(result["result"]["transaction_count"], 3)
+                self.assertEqual(result["result"]["projects"][0]["transaction_count"], 3)
+                self.assertEqual(result["grounding"]["matched_transaction_count"], 3)
 
     def test_grounded_party_summary_excludes_deleted_and_out_of_period_rows(self):
         result = self.engine.query(

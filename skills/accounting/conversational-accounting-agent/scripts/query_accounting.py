@@ -114,6 +114,16 @@ def _resolve_project(project_rows, requested):
     needle = _key(requested)
     if not needle:
         return None
+    # Returned context carries the canonical ID. Resolve it before name aliases
+    # or case-insensitive matches so a follow-up retains the selected identity.
+    requested_id = str(requested).strip()
+    for row in project_rows:
+        project_id = str(row.get("project_id") or "").strip()
+        if project_id and requested_id == project_id:
+            return {
+                "project_id": project_id,
+                "project_name": str(row.get("project_name") or "").strip(),
+            }
     exact = []
     partial = []
     for row in project_rows:
@@ -234,7 +244,9 @@ def _context(effective, selected):
         "intent": effective["intent"],
         "period": effective["period"],
         "metric": effective["metric"],
-        "project": selected["project_name"] if selected else None,
+        "project": (
+            selected["project_id"] or selected["project_name"]
+        ) if selected else None,
         "party": _text(effective["party"]) or None,
         "party_role": effective["party_role"],
     }
