@@ -141,6 +141,32 @@ class TelegramTransactionWiringTests(unittest.TestCase):
         prompt = self.click(prompt, "expense")["prompt"]
         return self.click(prompt, "materials")["prompt"]
 
+    def test_review_shows_durable_values_without_saving(self):
+        prompt = self.advance_to_review()
+        before = self.flow.get_transaction(self.record["transaction_id"], **self.actor)
+        for expected in ("PHASE-C-001", "1250.5 บาท", "2026-08-30", "Project A",
+                         "ประเภท: รายจ่าย", "หมวด: ค่าวัสดุ",
+                         "ผู้โอน: ไม่ระบุ", "ผู้รับเงิน: ไม่ระบุ"):
+            self.assertIn(expected, prompt["text"])
+        self.assertEqual(self.pipeline.calls, 0)
+        self.assertEqual(before["current_state"], "waiting_review")
+        self.controller.render(self.record["transaction_id"], **self.actor)
+        self.assertEqual(before, self.flow.get_transaction(
+            self.record["transaction_id"], **self.actor))
+        self.assertEqual([self.wiring.decode_callback(b["callback_data"]).action
+                          for b in prompt["buttons"]], ["confirm", "back", "cancel"])
+
+    def test_review_preserves_parties_custom_category_and_duplicate_warning(self):
+        self.advance_to_review()
+        record = self.flow.get_transaction(self.record["transaction_id"], **self.actor)
+        record["ocr_fields"].update(payer="Test Sender", payee="Test Receiver")
+        record["category"] = "Custom category"
+        record["duplicate_candidate_transaction_id"] = "synthetic-candidate"
+        text = self.controller._prompt_text(record)
+        for expected in ("ผู้โอน: Test Sender", "ผู้รับเงิน: Test Receiver",
+                         "หมวด: Custom category", "พบรายการเดิมที่คล้ายกัน"):
+            self.assertIn(expected, text)
+
     def make_failed_missing_amount(self):
         review = self.advance_to_review()
         intent = self.flow.confirm(

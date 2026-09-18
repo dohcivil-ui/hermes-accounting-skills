@@ -588,6 +588,34 @@ class TelegramTransactionController:
             return candidate_warning + "พิมพ์ชื่อโครงการสำหรับรายการนี้"
         if state == "waiting_category" and record.get("entry_mode") == "category":
             return candidate_warning + "พิมพ์หมวดรายการ"
+        if state == "waiting_review":
+            fields = record.get("ocr_fields") or {}
+
+            def display(value):
+                text = " ".join(str(value).split()) if value is not None else ""
+                return text or "ไม่ระบุ"
+
+            category_labels = {
+                "materials": "ค่าวัสดุ", "labor": "ค่าแรง",
+                "transport": "ค่าขนส่ง", "contractor": "ผู้รับเหมา",
+                "other": "อื่นๆ", "installment": "รับงวดงาน",
+                "advance_refund": "เงินทดรอง/คืนเงิน",
+            }
+            transaction_type = record.get("transaction_type")
+            category = record.get("category")
+            return candidate_warning + "\n".join([
+                "ตรวจสอบข้อมูลก่อนยืนยันการบันทึก",
+                f"อ้างอิง: {display(record.get('reference_no'))}",
+                f"ยอดเงิน: {display(fields.get('amount'))} บาท",
+                f"วันที่: {display(fields.get('date'))}",
+                f"โครงการ: {display(record.get('project'))}",
+                "ประเภท: " + display({"income": "รายรับ", "expense": "รายจ่าย"}.get(
+                    transaction_type, transaction_type)),
+                f"หมวด: {display(category_labels.get(category, category))}",
+                f"ผู้โอน: {display(fields.get('payer'))}",
+                f"ผู้รับเงิน: {display(fields.get('payee'))}",
+                "ยังไม่ได้บันทึก กรุณาตรวจสอบก่อนกดคอนเฟิร์ม",
+            ])
         labels = {
             "waiting_project": "เลือกโครงการสำหรับรายการนี้",
             "waiting_user": "เลือกผู้ส่งรายการ",
