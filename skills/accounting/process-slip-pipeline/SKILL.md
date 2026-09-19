@@ -1,6 +1,6 @@
 ---
 name: process-slip-pipeline
-description: Use when processing bank slip images from Telegram via AksonOCR script.
+description: Use for Telegram slip processing through the AksonOCR bridge and durable transaction handoff.
 platforms: [linux]
 metadata:
   hermes:
@@ -10,25 +10,19 @@ metadata:
 
 # Process Slip Pipeline (AksonOCR-First)
 
-## Mandatory Execution & Implementation
-1. **Script Path**: `/data/skills/accounting/process-slip-pipeline/scripts/process_slip.py`
-2. **HTTP Endpoint**: `https://backend.aksonocr.com/api/v2/upload`
-3. **Environment**: Uses `AKSONOCR_API_KEY` from the selected Hermes runtime environment.
-4. **Execution Flow**:
-   - When a Telegram image is received, the gateway maps the image attachment path and passes it to `process_slip.py`.
-   - `process_slip.py` performs the HTTP POST request to AksonOCR.
-   - Hermes receives the raw OCR text and confidence, parses the fields, and presents:
-     - OCR source: AksonOCR
-     - confidence: [score]
-     - raw_ocr_text: [3-5 lines snippet]
-     - parsed fields (date, amount, payer, payee, reference_no, note)
-     - status: waiting_for_confirm
-### 6. Master Data Management (Users & Projects)
-- **Users Table**: Before saving any transaction, inspect the `Users` sheet using the Telegram `user_id`. If not present, create a new user entry automatically (1 time). If already present, do not duplicate.
-- **Projects Table**: Check the project name/ID against the `Projects` sheet. If it exists, use the existing `project_id`. If it does not exist, ask the user if it's a new project. Only add to `Projects` after explicit user confirmation. Prevent duplicate projects.
-- **Transactions Appending**: Upon user confirmation:
-  1. Upload slip image to Google Drive folder (`LEKZA_SLIP_FOLDER_ID`) with name `YYYY-MM-DD_reference_no.jpg`.
-  2. Get `webViewLink` and assign to `Transactions.slip_url`.
-  3. Verify `reference_no` in `Transactions` to prevent duplicate transaction entries.
-  4. Append exactly 1 row to `Transactions`.
-  5. Master data (Users and Projects) are maintained independently and not recreated per transaction.
+## OCR และการส่งต่อ
+
+- `accounting-slip-bridge` เป็นเจ้าของ OCR สำหรับภาพจาก Telegram: ตรวจ ingress/duplicate แล้วใช้ AksonOCR จาก environment ของ runtime ที่เลือก
+- Bridge normalize ผลเดิมและส่งเข้า `accounting-transaction-buttons` เพื่อสร้าง/กู้คืน durable transaction และแสดงปุ่ม; เมื่อ handoff สำเร็จจะข้ามบทสนทนา Agent สำหรับภาพนั้น
+- ใช้ [accounting-button-flow](../accounting-button-flow/SKILL.md) สำหรับขอบเขตปุ่ม state และการยืนยัน ห้ามสร้าง wizard หรือ pending ซ้อน
+- ห้ามใช้ Vision หรือเรียก OCR ซ้ำเมื่อมีผล AksonOCR แล้ว
+
+CLI adapter เดิมอยู่ที่ `/data/skills/accounting/process-slip-pipeline/scripts/process_slip.py` และใช้ `https://backend.aksonocr.com/api/v2/upload` ผ่าน `AKSONOCR_API_KEY`; ไม่ใช่ fallback ที่ Agent เรียกซ้ำเมื่อ Telegram handoff ล้มเหลว
+
+## เมื่อส่งต่อไม่สำเร็จ
+
+หากได้รับ `[AksonOCR Slip Result]` พร้อม `handoff_failed` ให้ใช้เฉพาะผล OCR ที่มีเพื่ออธิบายปัญหา แจ้งว่าส่งต่อเข้า flow ไม่สำเร็จและยังยืนยันสถานะบันทึกไม่ได้ ต้องตรวจรายการเดิมก่อนดำเนินการต่อ ห้ามขอ Confirm เปิด wizard สั่งส่งสลิปซ้ำ หรืออ้างว่ารายการยังไม่ถูกสร้าง
+
+## เจ้าของการเขียน
+
+การยืนยันและบันทึกเป็นหน้าที่ของ durable controller / `ProductionSavePipeline` เท่านั้น ห้าม Agent สร้าง Users/Projects อัตโนมัติ upload Drive หรือ append Transactions เอง แม้ผู้ใช้ตอบยืนยันในบทสนทนา เส้นทาง save ปัจจุบันยังไม่มีขั้นตอนสร้าง master data

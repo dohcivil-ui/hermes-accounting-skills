@@ -268,6 +268,91 @@ def _normalized_party_note_text(value):
     return " ".join(value.split())
 
 
+def _add_labeled_text_fields(parsed, ocr_result):
+    """Fill missing fields from unambiguous labeled OCR text, without I/O."""
+    from datetime import date
+    from decimal import Decimal, InvalidOperation
+
+    labels = {
+        "amount": ("Transfer amount", "Amount", "จำนวนเงิน", "ยอดเงิน"),
+        "date": ("Date", "วันที่"),
+        "payer": ("Payer", "ผู้โอน", "ผู้จ่ายเงิน"),
+        "payee": ("Payee", "ผู้รับเงิน", "ผู้รับ"),
+    }
+    texts = [ocr_result.get("raw_ocr_text"), ocr_result.get("text")]
+    raw = ocr_result.get("raw_response")
+    mappings = [ocr_result, ocr_result.get("parsed")]
+    if isinstance(raw, dict):
+        mappings.extend((raw, raw.get("parsed"), raw.get("data")))
+        texts.extend((raw.get("text"), raw.get("raw_ocr_text")))
+        pages = raw.get("pages")
+        if isinstance(pages, list):
+            texts.extend(p.get("markdown") for p in pages if isinstance(p, dict))
+    all_labels = {unicodedata.normalize("NFKC", label).casefold()
+                  for group in labels.values() for label in group}
+    all_labels.update(("time", "reference", "purpose", "เวลา", "หมายเลขอ้างอิง"))
+    for field, aliases in labels.items():
+        # Never overwrite structured values, including invalid/ambiguous values.
+        if any(isinstance(m, dict) and m.get(field) not in (None, "")
+               for m in [parsed] + mappings):
+            continue
+        values = set()
+        pattern = re.compile(
+            r"^(?:" + "|".join(re.escape(unicodedata.normalize("NFKC", x))
+                               for x in aliases) + r")(?:\s*[:：]\s*|\s+|$)(.*)$",
+            re.IGNORECASE,
+        )
+        for text in texts:
+            if not isinstance(text, str):
+                continue
+            text = unicodedata.normalize("NFKC", text)
+            text = _MARKDOWN_EMPHASIS_OPEN_PATTERN.sub("", text)
+            text = _MARKDOWN_EMPHASIS_CLOSE_PATTERN.sub("", text)
+            lines = [line.strip() for line in text.splitlines() if line.strip()]
+            for index, line in enumerate(lines):
+                match = pattern.fullmatch(line)
+                if not match:
+                    continue
+                value = match.group(1).strip()
+                if not value and index + 1 < len(lines):
+                    value = lines[index + 1]
+                if not value or value.rstrip(":：").casefold() in all_labels:
+                    values.add(None)
+                    continue
+                if field == "amount":
+                    amount = re.fullmatch(
+                        r"(?:THB\s*|฿\s*)?((?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d{1,2})?)(?:\s*(?:THB|บาท))?",
+                        value, re.IGNORECASE,
+                    )
+                    if not amount:
+                        values.add(None)
+                        continue
+                    try:
+                        value = Decimal(amount.group(1).replace(",", ""))
+                    except InvalidOperation:
+                        values.add(None)
+                        continue
+                    if value <= 0:
+                        values.add(None)
+                        continue
+                elif field == "date":
+                    if not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", value):
+                        values.add(None)
+                        continue
+                    try:
+                        value = date.fromisoformat(value).isoformat()
+                    except ValueError:
+                        values.add(None)
+                        continue
+                elif len(value) > 160 or any(c in value for c in "|:："):
+                    values.add(None)
+                    continue
+                values.add(value)
+        if len(values) == 1 and None not in values:
+            value = values.pop()
+            parsed[field] = str(value) if field == "amount" else value
+
+
 def _normalize_ocr_result_for_handoff(ocr_result):
     if not isinstance(ocr_result, dict):
         raise ValueError("OCR result must be a mapping")
@@ -329,6 +414,7 @@ def _normalize_ocr_result_for_handoff(ocr_result):
     parsed.pop("date", None)
     if normalized_date is not None:
         parsed["date"] = normalized_date
+    _add_labeled_text_fields(parsed, ocr_result)
     normalized["parsed"] = parsed
     return normalized
 
@@ -1075,15 +1161,16 @@ def register(ctx):
 - raw_ocr_text: {raw_text}
 - parsed fields: {json.dumps(parsed_fields, ensure_ascii=False)}
 - usage: {json.dumps(usage, ensure_ascii=False)}
-- status: waiting_for_confirm
+- status: handoff_failed
 - transaction_id: {transaction_id or "unavailable"}
 - telegram_buttons: {"scheduled" if transaction_id else "unavailable"}
 
 คำสั่งระบบสำหรับ Agent:
 1. ห้ามใช้ Vision อ่านสลิปซ้ำ ให้สรุปรายการจากผล AksonOCR ด้านบนเท่านั้น
-2. แสดงรายละเอียดรายการและยอดเงินให้ผู้ใช้ตรวจสอบ
-3. ต้องถามผู้ใช้ให้กด Confirm หรือยืนยันก่อนดำเนินการใดๆ
-4. ห้ามเขียนหรือบันทึกข้อมูลลง Google Drive หรือ Google Sheets จนกว่าจะได้รับการยืนยัน (Confirm) จากผู้ใช้ที่ถูกต้อง
+2. แจ้งว่าส่งต่อเข้า durable transaction flow ไม่สำเร็จ และยังยืนยันสถานะบันทึกไม่ได้ ต้องตรวจรายการเดิมก่อนดำเนินการต่อ
+3. ห้ามเปิด wizard เรียก clarify ขอ Confirm หรือถือว่าข้อความยืนยันเป็นสิทธิ์บันทึกแทน durable callback
+4. ห้ามเขียน Google Drive / Google Sheets สร้าง master data หรือแก้ pending state เอง
+5. ห้ามสั่งส่งสลิปซ้ำหรือเรียก OCR ซ้ำ และห้ามอ้างว่ารายการยังไม่ถูกสร้าง
 """
                 return {
                     "action": "rewrite",

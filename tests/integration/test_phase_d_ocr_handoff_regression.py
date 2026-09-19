@@ -167,12 +167,9 @@ class PhaseDOcrHandoffRegressionTests(unittest.TestCase):
         self.assertTrue(supplied["ok"])
         prompt = supplied["prompt"]
         self.assertEqual(prompt["current_state"], "waiting_project")
-        self.assertIn("วันที่", prompt["text"])
-        supplied_date = self.controller.handle_manual_message(
-            "2026-09-01", **actor
-        )
-        self.assertTrue(supplied_date["ok"])
-        prompt = supplied_date["prompt"]
+        self.assertIn("เลือกโครงการ", prompt["text"])
+        persisted = self.flow.get_transaction(created["transaction_id"], **actor)
+        self.assertEqual(persisted["ocr_fields"]["date"], "2026-09-01")
 
         second = self.controller.begin_from_ocr(
             tenant_id="phase-d-missing-reference-tenant",
